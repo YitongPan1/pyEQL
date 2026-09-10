@@ -14,7 +14,7 @@ its calculations. The database includes:
 - Dielectric constant model parameters for 18 ions
 - Partial molar volumes for 24 ions
 
-`pyEQL` can automatically infer basic chemical informatics such as molecular weight and charge by passing a solute's formula to `pymatgen.core.ion.Ion` (See [chemical formulas](#chemistry)). For other physicochemical properties, it relies on data compiled into the included database. A list of the data and species covered is available [below](#species-included)
+`pyEQL` can automatically infer basic chemical informatics such as molecular weight and charge by passing a solute's formula to `pymatgen.core.ion.Ion` (See [chemical formulas](chemistry.md)). For other physicochemical properties, it relies on data compiled into the included database. A list of the data and species covered is available [below](#species-included)
 
 ## Format
 
@@ -141,7 +141,7 @@ The database currently contains one or more physichochemical properties for each
  - Be[+2]
  - Bi[+3]
  - BrO3[-1]
- - Br[-0.33333333]
+ - Br3[-1]
  - Br[-1]
  - C2N3[-1]
  - CH3COO[-1]

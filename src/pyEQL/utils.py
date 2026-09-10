@@ -7,6 +7,7 @@ pyEQL utilities
 """
 
 import logging
+import re
 from collections import UserDict
 from functools import lru_cache
 from typing import Any
@@ -19,7 +20,7 @@ from pyEQL import ureg
 logger = logging.getLogger(__name__)
 
 
-def interpret_units(unit: str) -> str:
+def translate_units(unit: str) -> str:
     """
     Translate commonly used environmental units such as 'ppm' into strings that `pint` can understand.
 
@@ -38,6 +39,30 @@ def interpret_units(unit: str) -> str:
         return "ng/L"
     # if all else fails, return the unit we were provided
     return unit
+
+
+def _translate_pint_quantity(amount: str):
+    """
+    Helper method to split a pint quantity string into magnitude and units.
+    """
+    import re  # noqa: PLC0415
+
+    from pint import Quantity  # noqa: PLC0415
+
+    # skip if already a pint Quantity
+    if isinstance(amount, Quantity):
+        return amount.magnitude, str(amount.units)
+
+    match = re.match(r"^\s*([0-9eE+\-*/().]+)\s*(.*)$", amount)
+
+    if match is None:
+        return amount
+
+    _value, _unit = match.groups()
+    # handle python ** expression in Pint quantity
+    _value = eval(_value) if "**" in _value else float(_value)
+    unit = translate_units(_unit)
+    return (float(_value), unit)
 
 
 @lru_cache
@@ -72,6 +97,16 @@ def standardize_formula(formula: str):
     for char, rep in zip("₀₁₂₃₄₅₆₇₈₉", "0123456789", strict=False):
         formula = formula.replace(char, rep)
 
+    # replace different types of dashes with a minus sign
+    for char in [r"‑", r"‐", r"‒", r"–", r"—", r"−"]:  # noqa: RUF001
+        formula = formula.replace(char, "-")
+
+    # Do not modify any dimers etc (Phreeqc reports a small amount of
+    # "(CO2)2" in a water solution with C(4), for example.
+    _POLYMER_RE = re.compile(r"^\([A-Za-z0-9+-]+\)\d+$")
+    if _POLYMER_RE.match(formula):
+        return formula
+
     sform = Ion.from_formula(formula).reduced_formula
 
     # TODO - manual formula adjustments. May be implemented upstream in pymatgen in the future
@@ -99,13 +134,24 @@ def standardize_formula(formula: str):
     # thiocyanate
     elif "CSN" in sform:
         sform = sform.replace("CSN", "SCN")
-    # triiodide, nitride, an phosphide
+    # triiodide, trinitride, tribromide and phosphide
     elif sform == "I[-0.33333333]":
         sform = "I3[-1]"
     elif sform == "N[-0.33333333]":
         sform = "N3[-1]"
+    elif sform == "Br[-0.33333333]":
+        sform = "Br3[-1]"
     elif sform == "P[-0.33333333]":
         sform = "P3[-1]"
+    # sulfur species
+    elif sform == "S[-0.4]":
+        sform = "S5[-2]"
+    elif sform == "S[-0.5]":
+        sform = "S4[-2]"
+    elif sform == "S[-0.66666667]":
+        sform = "S3[-2]"
+    elif sform == "S[-1]":
+        sform = "S2[-2]"  # note: S2[-2] has lower ΔGf than S[-2], so we want to standardize to S2[-2] rather than S[-2]
     # formate
     elif sform == "HCOO[-1]":
         sform = "HCO2[-1]"
@@ -209,13 +255,41 @@ class FormulaDict(UserDict):
     formula notation (e.g., "Na+", "Na+1", "Na[+]" all have the same effect)
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        # Whether self.data is currently in sorted (descending-by-value) order. Set before
+        # calling super().__init__ because that may trigger __setitem__ during construction.
+        self._sorted = True
+        super().__init__(*args, **kwargs)
+
+    def _ensure_sorted(self) -> None:
+        """Sort the underlying data by value (descending) if a mutation invalidated the order."""
+        if not self._sorted:
+            self.data = dict(sorted(self.data.items(), key=lambda x: x[1], reverse=True))
+            self._sorted = True
+
     def __getitem__(self, key) -> Any:
         return super().__getitem__(standardize_formula(key))
 
     def __setitem__(self, key, value) -> None:
-        super().__setitem__(standardize_formula(key), value)
-        # sort contents anytime an item is set
-        self.data = dict(sorted(self.items(), key=lambda x: x[1], reverse=True))
+        # ensure that all values are stored as python floats, not numpy types
+        # see https://numpy.org/doc/stable/release/2.0.0-notes.html#representation-of-numpy-scalars-changed
+        super().__setitem__(standardize_formula(key), float(value))
+        # defer sorting until the contents are next iterated (lazy sort via _ensure_sorted),
+        # which avoids an O(n log n) re-sort on every assignment
+        self._sorted = False
+
+    def __iter__(self):
+        # Iteration is the read barrier: keys(), values(), items(), list(), dict(), and
+        # `for` loops all funnel through here, so sorting now guarantees callers observe
+        # the same descending-by-amount order they did under eager sorting.
+        self._ensure_sorted()
+        return iter(self.data)
+
+    def __repr__(self) -> str:
+        # UserDict.__repr__ reads self.data directly, bypassing __iter__; sort first so the
+        # printed representation matches iteration order.
+        self._ensure_sorted()
+        return super().__repr__()
 
     # Necessary to define this so that .get() works properly in python 3.12+
     # see https://github.com/python/cpython/issues/105524
@@ -224,3 +298,5 @@ class FormulaDict(UserDict):
 
     def __delitem__(self, key) -> None:
         super().__delitem__(standardize_formula(key))
+        # deleting a key preserves the relative order of the remaining items, so the
+        # sorted/dirty state is unchanged.

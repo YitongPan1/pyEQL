@@ -5,9 +5,15 @@ developed and maintained by the Kingsbury Lab at Princeton University.
 
 Other contributors, listed alphabetically, are:
 
+- Vineet Basal (@vineetbansal)
 - Arpit Bhardwaj (@abhardwaj73)
+- Nikhil Dhruv (@NikhilDhruv)
 - Dhruv Duseja (@DhruvDuseja)
+- @githubalexliu
 - Hernan Grecco (@hgrecco)
+- @Ouriel Ndalamba (@Ouriel-N)
+- Ugo Nwosu (@ugognw)
+- Yitong Pan (@YitongPan1)
 - Jaebeom Park (@Jaebeom-P)
 - Kirill Pushkarev (@kirill-push)
 - Andrew Rosen (@arosen93)

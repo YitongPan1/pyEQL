@@ -3,17 +3,31 @@ Tests of pyEQL.utils module
 
 """
 
+import numpy as np
 from iapws import IAPWS95, IAPWS97
 from pytest import raises
 
 from pyEQL import ureg
-from pyEQL.utils import FormulaDict, create_water_substance, format_solutes_dict, standardize_formula
+from pyEQL.utils import (
+    FormulaDict,
+    _translate_pint_quantity,
+    create_water_substance,
+    format_solutes_dict,
+    standardize_formula,
+)
 
 
 def test_standardize_formula():
     """
     Test formula standardization
     """
+    # test weird hyphens, super/subscripts
+    assert standardize_formula("Mg⁺²") == "Mg[+2]"
+    assert standardize_formula("VO²⁺") == "VO[+2]"
+    assert standardize_formula("SO₄²⁻") == "SO4[-2]"
+    for dash in ["‑", "‐", "‒", "–", "—", "−"]:  # noqa: RUF001
+        assert standardize_formula(f"Cl{dash}") == "Cl[-1]"
+
     assert standardize_formula("H2O") == "H2O(aq)"
     assert standardize_formula("Na+") == "Na[+1]"
     assert standardize_formula("Na[+]") == "Na[+1]"
@@ -28,6 +42,7 @@ def test_standardize_formula():
     assert standardize_formula("I3-") == "I3[-1]"
     assert standardize_formula("N3-") == "N3[-1]"
     assert standardize_formula("P3-") == "P3[-1]"
+    assert standardize_formula("Br3-") == "Br3[-1]"
     assert standardize_formula("HCOO-") == "HCO2[-1]"
     assert standardize_formula("CO2-1") == "C2O4[-2]"
     assert standardize_formula("C2O4--") == "C2O4[-2]"
@@ -35,6 +50,11 @@ def test_standardize_formula():
     assert standardize_formula("H2SO4") == "H2SO4(aq)"
     assert standardize_formula("HClO4") == "HClO4(aq)"
     assert standardize_formula("CF3SO3-") == "CF3SO3[-1]"
+    assert standardize_formula("S5-2") == "S5[-2]"
+    assert standardize_formula("S5--") == "S5[-2]"
+    assert standardize_formula("S[-0.4]") == "S5[-2]"
+    assert standardize_formula("S[-0.5]") == "S4[-2]"
+    assert standardize_formula("S[-0.66666667]") == "S3[-2]"
     # superscripts, subscripts, and permuted sign/charge number
     assert standardize_formula("PO₄³⁻") == "PO4[-3]"
     assert standardize_formula("Co²⁺") == "Co[+2]"
@@ -55,6 +75,10 @@ def test_standardize_formula():
     assert standardize_formula("(NH4)2SO4") == "(NH4)2SO4(aq)"
     assert standardize_formula("NH4SO4-") == "NH4SO4[-1]"
 
+    # Polymers should be left intact
+    assert standardize_formula("(CO2)2") == "(CO2)2"
+    assert standardize_formula("(H2O)3") == "(H2O)3"
+
 
 def test_formula_dict():
     """
@@ -67,7 +91,7 @@ def test_formula_dict():
     del d["Mg+2"]
     assert "Mg[+2]" not in d
     assert not d.get("Mg[++]")
-    d.update({"Cl-": 0.5})
+    d.update({"Cl-": np.float64(0.5)})
     print(d, d.data)
     assert d["Cl[-1]"] == 0.5
     assert d.get("Na+") == 0.5
@@ -92,3 +116,13 @@ def test_format_solute():
 def test_create_water_substance():
     assert isinstance(create_water_substance(300, 0.1), IAPWS97)
     assert isinstance(create_water_substance(ureg.Quantity(-15, "degC"), 0.1), IAPWS95)
+
+
+def test_translate_pint_quantity():
+    import pytest  # noqa: PLC0415
+
+    assert _translate_pint_quantity("5mol/kg") == (5, "mol/kg")
+    assert _translate_pint_quantity("0.1g/L") == (0.1, "g/L")
+    assert _translate_pint_quantity("1ppb") == (1, "ug/L")
+    assert _translate_pint_quantity("0.01 ppm") == (0.01, "mg/L")
+    assert _translate_pint_quantity("10**(-10.3) mol/L") == pytest.approx((5.011872336e-11, "mol/L"))

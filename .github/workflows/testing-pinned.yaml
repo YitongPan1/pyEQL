@@ -1,0 +1,48 @@
+name: testing-pinned
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - CHANGELOG.md
+      - AUTHORS.md
+      - README.md
+      - docs/**
+
+jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  test:
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        # We only test on min. and max. supported Python versions here.
+        python-version: ["3.11", "3.14"]
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - macos-14
+          - windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}${{ matrix.dev }}
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+
+      - name: Run tests
+        run: |
+          pytest -n auto --dist=loadscope

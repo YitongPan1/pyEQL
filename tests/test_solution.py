@@ -7,15 +7,23 @@ used by pyEQL's Solution class
 """
 
 import copy
-import os
-import platform
+import logging
+from importlib.resources import files
+from itertools import zip_longest
 
 import numpy as np
+import plotly.graph_objs as go
 import pytest
 import yaml
+from monty.serialization import dumpfn, loadfn
+from pint import Quantity
 
-from pyEQL import Solution, ureg
-from pyEQL.engines import IdealEOS, NativeEOS
+import pyEQL
+import pyEQL.activity_correction as ac
+from pyEQL import Solution, engines, ureg
+from pyEQL import solution as solution_module
+from pyEQL.engines import PHREEQPYTHON_AVAILABLE, IdealEOS, NativeEOS
+from pyEQL.salt_ion_match import Salt
 from pyEQL.solution import UNKNOWN_OXI_STATE
 
 
@@ -64,8 +72,8 @@ def s6():
             ["Ag+1", "10 mM"],  # no contribution to alk or hardness
             ["CO3-2", "6 mM"],  # no contribution to alk or hardness
             ["SO4-2", "60 mM"],  # -120 meq/L
-            ["Br-", "20 mM"],
-        ],  # -20 meq/L
+            ["Br-", "20 mM"],  # -20 meq/L
+        ],
         volume="1 L",
     )
 
@@ -83,14 +91,72 @@ def s6_Ca():
             ["Ag+1", "10 mM"],  # no contribution to alk or hardness
             ["CO3-2", "6 mM"],  # no contribution to alk or hardness
             ["SO4-2", "60 mM"],  # -120 meq/L
-            ["Br-", "20 mM"],
-        ],  # -20 meq/L
+            ["Br-", "20 mM"],  # -20 meq/L
+        ],
         volume="1 L",
         balance_charge="Ca+2",
     )
 
 
-def test_empty_solution_3():
+@pytest.fixture
+def s7():
+    # unstable solution in specific redox and pH combinations
+    return Solution(
+        [
+            ["Na+", "100 mM"],  # 100 meq/L
+            ["Cl-", "100 mM"],  # -100 meq/L
+        ],
+        volume="1 L",
+        pH=20,
+        pE=1,
+    )
+
+
+@pytest.fixture
+def s8():
+    # unstable solution in specific redox and pH combinations
+    return Solution(
+        [
+            ["Na+", "100 mM"],  # 100 meq/L
+            ["Cl-", "100 mM"],  # -100 meq/L
+        ],
+        volume="1 L",
+        pH=0,
+        pE=-10,
+    )
+
+
+@pytest.fixture
+def s9():
+    # weak acid for alkalinity with pH variation
+    return Solution(
+        [
+            ["H3PO4(aq)", "1 mM"],  # no contribution to alk or hardness
+            ["H2PO4-", "1 mM"],  # -1 meq/L
+            ["HPO4-2", "1 mM"],  # -2 meq/L
+        ],
+        volume="1 L",
+        pH=3,
+    )
+
+
+@pytest.fixture
+def s10():
+    # both conservative cation and weak acid for alkalinity with pH variation
+    return Solution(
+        [
+            ["Ca+2", "1 mM"],  # 2 meq/L
+            ["Na+", "1 mM"],  # 1 meq/L
+            ["H3SiO4-", "1 mM"],  # -1 meq/L
+            ["H2SiO4-2", "1 mM"],  # -2 meq/L
+            ["SiO2(aq)", "1 mM"],  # no contribution to alk or hardness
+        ],
+        volume="1 L",
+        pH=4,
+    )
+
+
+def test_empty_solution():
     # create an empty solution
     s1 = Solution(database=None)
     # It should return type Solution
@@ -111,9 +177,12 @@ def test_empty_solution_3():
     assert np.isclose(s1.pE, 8.5)
     # it should contain H2O, H+, and OH- species
     assert set(s1.components.keys()) == {"H2O(aq)", "OH[-1]", "H[+1]"}
+    assert np.isclose(s1.density.to("kg/m**3").magnitude, 997.0479, atol=0.1)
+    assert np.isclose(s1.viscosity_kinematic.to("mm**2/s").magnitude, 0.8917, atol=1e-3)  # 1 cSt = 1 mm2/s
+    assert np.isclose(s1.viscosity_dynamic, s1.viscosity_kinematic * s1.density, atol=1e-8)
 
 
-@pytest.mark.skipif(platform.machine() == "arm64" and platform.system() == "Darwin", reason="arm64 not supported")
+@pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
 def test_oxi_state_handling():
     # see https://github.com/KingsburyLab/pyEQL/issues/116
     # and https://github.com/materialsproject/pymatgen/issues/3687
@@ -175,13 +244,20 @@ def test_diffusion_transport(s1, s2):
     assert np.isclose(D2 / D1, 0.80, atol=1e-2)
 
 
-def test_init_raises():
+def test_init_raises(caplog):
     with pytest.raises(ValueError, match="random is not a valid value"):
         Solution(engine="random")
     with pytest.raises(ValueError, match="Non-aqueous solvent detected"):
         Solution(solvent="D2O")
     with pytest.raises(ValueError, match="Multiple solvents"):
         Solution(solvent=["D2O", "MeOH"])
+    with pytest.warns(UserWarning, match="After initialization, the calculated solution pH"):
+        Solution({"HCO3-": "1 mM", "CO3--": "1 mM", "H+": "1 mM"}, pH=10)
+    module_log = logging.getLogger("pyEQL")
+    with caplog.at_level(logging.WARNING, "pyEQL"):
+        Solution({"HCO3-": "1 mM", "CO3--": "1 mM", "H+": "1 mM"}, log_level="warning")
+        assert module_log.level == logging.WARNING
+        assert "WARNING" in caplog.text
 
 
 def test_init_engines():
@@ -247,6 +323,7 @@ def test_chempot_energy(s1, s2):
     pass
 
 
+@pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
 def test_charge_balance(s3, s5, s5_pH, s6, s6_Ca):
     assert np.isclose(s3.charge_balance, 0)
     assert np.isclose(s5.charge_balance, 0, atol=1e-5)
@@ -325,7 +402,21 @@ def test_charge_balance(s3, s5, s5_pH, s6, s6_Ca):
         s = Solution({"Na+": "2 mM", "Cl-": "2 mM"}, balance_charge="Zr[+4]")
 
 
-def test_alkalinity_hardness(s3, s5, s6):
+def test_water_stability_oxidizing(s7, caplog):
+    with caplog.at_level(logging.WARNING, logger=s7.logger.name):
+        s7._check_water_stability()
+
+    assert any("Oxygen evolution may occur" in message for message in caplog.messages)
+
+
+def test_water_stability_reducing(s8, caplog):
+    with caplog.at_level(logging.WARNING, logger=s8.logger.name):
+        s8._check_water_stability()
+
+    assert any("Hydrogen evolution may occur" in r.message for r in caplog.records)
+
+
+def test_alkalinity_hardness(s3, s5, s6, s9, s10):
     assert np.isclose(s3.hardness, 0)
     assert np.isclose(s3.alkalinity, 0)
 
@@ -334,6 +425,12 @@ def test_alkalinity_hardness(s3, s5, s6):
 
     assert np.isclose(s6.alkalinity.magnitude, -5900, rtol=0.005)
     assert np.isclose(s6.hardness.magnitude, 600, rtol=0.005)
+
+    assert np.isclose(s9.alkalinity.magnitude, 100.09, rtol=0.005)
+    assert np.isclose(s9.hardness.magnitude, 0, rtol=0.005)
+
+    assert np.isclose(s10.alkalinity.magnitude, 150.135, rtol=0.005)
+    assert np.isclose(s10.hardness.magnitude, 100.09, rtol=0.005)
 
 
 def test_pressure_temperature(s5):
@@ -359,6 +456,7 @@ def test_get_el_amt_dict(s6):
     # scale volume to 8L
     s6 *= 8
     d = s6.get_el_amt_dict()
+    d_nested = s6.get_el_amt_dict(nested=True)
     for el, amt in zip(
         ["H(1.0)", "O(-2.0)", "Ca(2.0)", "Mg(2.0)", "Na(1.0)", "Ag(1.0)", "C(4.0)", "S(6.0)", "Br(-1.0)"],
         [water_mol * 2 * 8, (water_mol + 0.018 + 0.24) * 8, 0.008, 0.040, 0.08, 0.08, 0.048, 0.48, 0.16],
@@ -366,16 +464,25 @@ def test_get_el_amt_dict(s6):
     ):
         assert np.isclose(d[el], amt, atol=1e-3)
 
+        el_no_valence = el.split("(")[0]
+        valence = float(el.split("(")[1].split(")")[0])
+        assert np.isclose(d_nested[el_no_valence][valence], amt, atol=1e-3)
+
     s = Solution({"Fe+2": "1 mM", "Fe+3": "5 mM", "FeCl2": "1 mM", "FeCl3": "5 mM"})
     d = s.get_el_amt_dict()
+    d_nested = s.get_el_amt_dict(nested=True)
     for el, amt in zip(["Fe(2.0)", "Fe(3.0)", "Cl(-1.0)"], [0.002, 0.01, 0.002 + 0.015], strict=False):
         assert np.isclose(d[el], amt, atol=1e-3)
+
+        el_no_valence = el.split("(")[0]
+        valence = float(el.split("(")[1].split(")")[0])
+        assert np.isclose(d_nested[el_no_valence][valence], amt, atol=1e-3)
 
 
 def test_p(s2):
     assert np.isclose(s2.p("Na+"), -1 * np.log10(s2.get_activity("Na+")))
     assert np.isclose(s2.p("Na+", activity=False), -1 * np.log10(s2.get_amount("Na+", "M").magnitude))
-    assert np.isclose(s2.p("Mg++"), 0)
+    assert np.isnan(s2.p("Mg++"))
 
 
 def test_get_amount(s3, s5):
@@ -447,11 +554,13 @@ def test_components_by_element(s1, s2):
         "Na(1.0)": ["Na[+1]"],
         "Cl(-1.0)": ["Cl[-1]"],
     }
-    if platform.machine() == "arm64" and platform.system() == "Darwin":
-        pytest.skip(reason="arm64 not supported")
+    if not PHREEQPYTHON_AVAILABLE:
+        pytest.skip(reason="Phreeqpython not available")
+
     s2.equilibrate()
-    assert s2.get_components_by_element() == {
-        "H(1.0)": ["H2O(aq)", "OH[-1]", "H[+1]", "HCl(aq)", "NaOH(aq)", "HClO(aq)", "HClO2(aq)"],
+
+    expected = {
+        "H(1.0)": ["H2O(aq)", "OH[-1]", "H[+1]", "HCl(aq)", "NaOH(aq)", "HClO(aq)"],
         "H(0.0)": ["H2(aq)"],
         "O(-2.0)": [
             "H2O(aq)",
@@ -459,19 +568,91 @@ def test_components_by_element(s1, s2):
             "NaOH(aq)",
             "HClO(aq)",
             "ClO[-1]",
-            "ClO2[-1]",
-            "ClO3[-1]",
-            "ClO4[-1]",
-            "HClO2(aq)",
         ],
         "O(0.0)": ["O2(aq)"],
         "Na(1.0)": ["Na[+1]", "NaCl(aq)", "NaOH(aq)"],
         "Cl(-1.0)": ["Cl[-1]", "NaCl(aq)", "HCl(aq)"],
         "Cl(1.0)": ["HClO(aq)", "ClO[-1]"],
-        "Cl(3.0)": ["ClO2[-1]", "HClO2(aq)"],
-        "Cl(5.0)": ["ClO3[-1]"],
-        "Cl(7.0)": ["ClO4[-1]"],
     }
+
+    assert s2.get_components_by_element(nested=False) == expected
+
+
+def test_components_by_element_nested(s1, s2):
+    assert s1.get_components_by_element(nested=True) == {
+        "H": {
+            1.0: ["H2O(aq)", "OH[-1]", "H[+1]"],
+        },
+        "O": {
+            -2.0: ["H2O(aq)", "OH[-1]"],
+        },
+    }
+
+    assert s2.get_components_by_element(nested=True) == {
+        "H": {
+            1.0: ["H2O(aq)", "OH[-1]", "H[+1]"],
+        },
+        "O": {
+            -2.0: ["H2O(aq)", "OH[-1]"],
+        },
+        "Na": {
+            1.0: ["Na[+1]"],
+        },
+        "Cl": {
+            -1.0: ["Cl[-1]"],
+        },
+    }
+
+    if not PHREEQPYTHON_AVAILABLE:
+        pytest.skip(reason="Phreeqpython not available")
+
+    s2.equilibrate()
+
+    expected = {
+        "H": {
+            1.0: [
+                "H2O(aq)",
+                "OH[-1]",
+                "H[+1]",
+                "HCl(aq)",
+                "NaOH(aq)",
+                "HClO(aq)",
+            ],
+            0.0: ["H2(aq)"],
+        },
+        "O": {
+            -2.0: [
+                "H2O(aq)",
+                "OH[-1]",
+                "NaOH(aq)",
+                "HClO(aq)",
+                "ClO[-1]",
+            ],
+            0.0: ["O2(aq)"],
+        },
+        "Na": {
+            1.0: ["Na[+1]", "NaCl(aq)", "NaOH(aq)"],
+        },
+        "Cl": {
+            -1.0: ["Cl[-1]", "NaCl(aq)", "HCl(aq)"],
+            1.0: ["HClO(aq)", "ClO[-1]"],
+        },
+    }
+
+    result = s2.get_components_by_element(nested=True)
+
+    assert result.keys() == expected.keys()
+    for element, oxidation_states in expected.items():
+        for oxi_state in oxidation_states:
+            if (element == "O" and oxi_state == -2.0) or (element == "Cl" and oxi_state == 3.0):
+                # for this particular element and oxidation state, the order of the species in the list is not guaranteed
+                assert set(result[element][oxi_state]) == set(expected[element][oxi_state]), (
+                    f"Mismatch for element '{element}', oxidation state {oxi_state}"
+                )
+            else:
+                assert result[element][oxi_state] == expected[element][oxi_state], (
+                    f"Mismatch for element '{element}', oxidation state {oxi_state}"
+                )
 
 
 def test_get_total_amount(s2):
@@ -485,7 +666,7 @@ def test_get_total_amount(s2):
     assert np.isclose(sox.get_total_amount("Fe", "mol").magnitude, 0.05)
 
 
-@pytest.mark.skipif(platform.machine() == "arm64" and platform.system() == "Darwin", reason="arm64 not supported")
+@pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
 def test_equilibrate(s1, s2, s5_pH):
     assert "H2(aq)" not in s1.components
     orig_pH = s1.pH
@@ -538,6 +719,20 @@ def test_equilibrate(s1, s2, s5_pH):
     assert np.isclose(s5_pH.pE, orig_pE)
 
 
+def test_redox():
+    # compare pE 0 and pE 10. higher pE should have more oxidized species
+    s1 = Solution({"Na[+]": "1 mg/L", "S[-2]": "1 mg/L"}, balance_charge="pH", pH=7, pE=0, engine="native")
+    s2 = Solution({"Na[+]": "1 mg/L", "S[-2]": "1 mg/L"}, balance_charge="pH", pH=7, pE=10, engine="native")
+    s1.equilibrate()
+    s2.equilibrate()
+    assert np.isclose(s1.get_total_amount("S", "mg/L").magnitude, s2.get_total_amount("S", "mg/L").magnitude, atol=1e-3)
+    assert s1.get_total_amount("S(-2)", "mg/L").magnitude > s2.get_total_amount("S(-2)", "mg/L").magnitude
+    assert s1.get_total_amount("S(-0.4)", "mg/L").magnitude < s2.get_total_amount("S(-0.4)", "mg/L").magnitude
+    # if oxygen is present, sulfate should form even at pE=0
+    s1.equilibrate(atmosphere=True)
+    assert s1.get_total_amount("S(6)", "mg/L").magnitude > 0
+
+
 def test_tds(s1, s2, s5):
     assert s1.total_dissolved_solids.magnitude == 0
     assert np.isclose(s2.total_dissolved_solids.magnitude, 4 * 58442.769)
@@ -559,9 +754,8 @@ def test_conductivity(s1, s2):
     # nacl
     for conc, cond in zip([0.001, 0.05, 0.1], [123.68, 111.01, 106.69], strict=False):
         s1 = Solution({"Na+": f"{conc} mol/L", "Cl-": f"{conc} mol/L"})
-        assert np.isclose(
-            s1.conductivity.to("S/m").magnitude, conc * cond / 10, atol=0.5
-        ), f"Conductivity test failed for NaCl at {conc} mol/L. Result = {s1.conductivity.to('S/m').magnitude}"
+        fail_msg = f"Conductivity test failed for NaCl at {conc} mol/L. Result = {s1.conductivity.to('S/m').magnitude}"
+        assert np.isclose(s1.conductivity.to("S/m").magnitude, conc * cond / 10, atol=0.5), fail_msg
 
     # higher concentration data points from Appelo, 2017 Figure 4.
     s1 = Solution({"Na+": "2 mol/kg", "Cl-": "2 mol/kg"})
@@ -569,10 +763,9 @@ def test_conductivity(s1, s2):
 
     # MgCl2
     for conc, cond in zip([0.001, 0.05, 0.1], [124.15, 114.49, 97.05], strict=False):
-        s1 = Solution({"Mg+2": f"{conc} mol/L", "Cl-": f"{2*conc} mol/L"})
-        assert np.isclose(
-            s1.conductivity.to("S/m").magnitude, 2 * conc * cond / 10, atol=1
-        ), f"Conductivity test failed for MgCl2 at {conc} mol/L. Result = {s1.conductivity.to('S/m').magnitude}"
+        s1 = Solution({"Mg+2": f"{conc} mol/L", "Cl-": f"{2 * conc} mol/L"})
+        fail_msg = f"Conductivity test failed for MgCl2 at {conc} mol/L. Result = {s1.conductivity.to('S/m').magnitude}"
+        assert np.isclose(s1.conductivity.to("S/m").magnitude, 2 * conc * cond / 10, atol=1), fail_msg
 
     # per CRC handbook "standard KCl solutions for calibrating conductivity cells", 0.1m KCl has a conductivity of 12.824 mS/cm at 25 C
     s_kcl = Solution({"K+": "0.1 mol/kg", "Cl-": "0.1 mol/kg"})
@@ -590,7 +783,7 @@ def test_conductivity(s1, s2):
     assert np.isclose(s_kcl.conductivity.magnitude, 10.862, atol=0.45)
 
 
-@pytest.mark.skipif(platform.machine() == "arm64" and platform.system() == "Darwin", reason="arm64 not supported")
+@pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
 def test_arithmetic_and_copy(s2, s6):
     s6_scale = copy.deepcopy(s6)
     s6_scale *= 1.5
@@ -649,133 +842,580 @@ def test_arithmetic_and_copy(s2, s6):
         s2 + s_bad
 
 
-def test_as_from_dict(s1, s2):
-    assert isinstance(s1.as_dict(), dict)
-    s1_new = Solution.from_dict(s1.as_dict())
-    assert s1_new.volume.magnitude == 2
-    assert s1_new._solutes["H[+1]"] == "2e-07 mol"
-    assert s1_new.get_total_moles_solute() == s1.get_total_moles_solute()
-    assert s1_new.components == s1.components
-    assert np.isclose(s1_new.pH, s1.pH)
-    assert np.isclose(s1_new._pH, s1._pH)
-    assert np.isclose(s1_new.pE, s1.pE)
-    assert np.isclose(s1_new._pE, s1._pE)
-    assert s1_new.temperature == s1.temperature
-    assert s1_new.pressure == s1.pressure
-    assert s1_new.solvent == s1.solvent
-    assert s1_new._engine == s1._engine
-    # the solutions should point to different EOS instances
-    assert s1_new.engine != s1.engine
-    # also should point to different Store instances
-    # TODO currently this test will fail due to a bug in maggma's __eq__
-    # assert s1_new.database != s1.database
+def test_from_dict_complex():
+    """
+    Test the behavior of as/from dict with a solution containing multiple solutes, that is
+    subjected too equilibration and forced volume updates to ensure volume, solvent mass,
+    and component amounts are all being properly serialized and deserialized. Test in
+    3 different unit systems to catch corner cases.
+    """
+    s1 = Solution({"Na+": "0.8 mol", "Cl-": "0.4 mol", "SO4-2": "0.2 mol"}, pH=2, volume="0.1 L")
+    s2 = Solution({"Na+": "0.8 mol/kg", "Cl-": "0.4 mol/kg", "SO4-2": "0.2 mol/kg"}, pH=2, volume="0.1 L")
+    s3 = Solution({"Na+": "0.8 mol/L", "Cl-": "0.4 mol/L", "SO4-2": "0.2 mol/L"}, pH=2, volume="0.1 L")
 
-    s2_new = Solution.from_dict(s2.as_dict())
-    assert s2_new.volume == s2.volume
-    # components concentrations should be the same
-    assert s2_new.components == s2.components
-    # but not point to the same instances
-    assert s2_new.components is not s2.components
-    assert s2_new.get_total_moles_solute() == s2.get_total_moles_solute()
-    assert np.isclose(s2_new.pH, s2.pH)
-    assert np.isclose(s2_new._pH, s2._pH)
-    assert np.isclose(s2_new.pE, s2.pE)
-    assert np.isclose(s2_new._pE, s2._pE)
-    assert s2_new.temperature == s2.temperature
-    assert s2_new.pressure == s2.pressure
-    assert s2_new.solvent == s2.solvent
-    assert s2_new._engine == s2._engine
-    # the solutions should point to different EOS instances
-    assert s2_new.engine != s2.engine
-    # also should point to different Store instances
-    # TODO currently this test will fail due to a bug in maggma's __eq__
-    # assert s2_new.database != s2.database
+    for s in [s1, s2, s3]:
+        orig_mass = s.mass
+
+        # equilibrate
+        s.equilibrate()
+        assert np.isclose(s.mass.magnitude, orig_mass.magnitude, atol=1e-5)
+        assert s.volume_update_required is True
+
+        # store the original properties
+        orig_H = s.components["H[+1]"]
+        orig_pH = s.pH
+        orig_volume = s.volume
+        orig_solv_mol = s.components["H2O(aq)"]
+        orig_solv_volume = s._get_solvent_volume()
+        orig_slt_volume = s._get_solute_volume()
+
+        # update volume
+        s._update_volume()
+
+        # still consistent?
+        assert np.isclose(s.pH, orig_pH, atol=0.00001)
+        assert np.isclose(s.volume.magnitude, orig_volume.magnitude, atol=1e-5)
+        assert np.isclose(s.components["H[+1]"], orig_H, atol=1e-8)
+        assert np.isclose(s.components["H2O(aq)"], orig_solv_mol, atol=1e-6)
+        assert np.isclose(s._get_solvent_volume().magnitude, orig_solv_volume.magnitude, atol=1e-5)
+        assert np.isclose(s._get_solute_volume().magnitude, orig_slt_volume.magnitude, atol=1e-5)
+        assert np.isclose(s.mass.magnitude, orig_mass.magnitude, atol=1e-5)
+
+        # serialize / deserialize
+        snew = Solution.from_dict(s.as_dict())
+
+        # still consistent?
+        assert np.isclose(snew.pH, orig_pH, atol=0.00001)
+        assert np.isclose(snew.volume.magnitude, orig_volume.magnitude, atol=1e-5)
+        assert np.isclose(snew.components["H[+1]"], orig_H, atol=1e-8)
+        assert np.isclose(snew.components["H2O(aq)"], orig_solv_mol, atol=1e-6)
+        assert np.isclose(snew._get_solvent_volume().magnitude, orig_solv_volume.magnitude, atol=1e-5)
+        assert np.isclose(snew._get_solute_volume().magnitude, orig_slt_volume.magnitude, atol=1e-5)
+        assert np.isclose(s.mass.magnitude, orig_mass.magnitude, atol=1e-5)
 
 
 def test_serialization(s1, s2, tmp_path):
-    from monty.serialization import dumpfn, loadfn
+    """Test that Solutions survive a round-trip through as_dict/from_dict and dumpfn/loadfn.
 
+    dumpfn/loadfn delegate to as_dict/from_dict for JSON files, so a single
+    helper that checks both paths avoids duplicating every assertion.
+    """
+
+    def assert_roundtrip(original, restored):
+        assert restored.volume == original.volume
+        assert restored.components == original.components
+        assert restored.components is not original.components
+        assert restored.get_total_moles_solute() == original.get_total_moles_solute()
+        assert np.isclose(restored.pH, original.pH)
+        assert np.isclose(restored._pH, original._pH)
+        assert np.isclose(restored.pE, original.pE)
+        assert np.isclose(restored._pE, original._pE)
+        assert restored.temperature == original.temperature
+        assert restored.pressure == original.pressure
+        assert restored.solvent == original.solvent
+        # the engine round-trips as a fully-serialized EOS: the restored Solution uses the same
+        # engine type (a deserialized Solution holds an EOS instance rather than the original name)
+        assert type(restored.engine) is type(original.engine)
+        assert restored.engine.as_dict() == original.engine.as_dict()
+        # the solutions should point to different EOS instances
+        assert restored.engine is not original.engine
+        # also should point to different Store instances
+        # TODO currently this test will fail due to a bug in maggma's __eq__
+        # assert restored.database != original.database
+
+    # as_dict / from_dict
+    assert isinstance(s1.as_dict(), dict)
+    assert_roundtrip(s1, Solution.from_dict(s1.as_dict()))
+    # s1-specific fields that aren't present on every Solution
+    s1_dict_restored = Solution.from_dict(s1.as_dict())
+    assert s1_dict_restored.volume.magnitude == 2
+    # pH is defined on the activity scale, so at pH 7 the H+ *concentration* is 10**(-7) / gamma_H+
+    # (close to, but not exactly, 1e-7 M). Check the H+ solute survives the round-trip rather than
+    # hard-coding a gamma-dependent value.
+    assert np.isclose(float(s1_dict_restored._solutes["H[+1]"].split()[0]), s1.components["H[+1]"])
+    assert_roundtrip(s2, Solution.from_dict(s2.as_dict()))
+
+    # dumpfn / loadfn (exercises the same code path via monty serialization)
     dumpfn(s1, str(tmp_path / "s1.json"))
-    s1_new = loadfn(str(tmp_path / "s1.json"))
-    assert s1_new.volume.magnitude == 2
-    assert s1_new._solutes["H[+1]"] == "2e-07 mol"
-    assert s1_new.get_total_moles_solute() == s1.get_total_moles_solute()
-    assert s1_new.components == s1.components
-    assert np.isclose(s1_new.pH, s1.pH)
-    assert np.isclose(s1_new._pH, s1._pH)
-    assert np.isclose(s1_new.pE, s1.pE)
-    assert np.isclose(s1_new._pE, s1._pE)
-    assert s1_new.temperature == s1.temperature
-    assert s1_new.pressure == s1.pressure
-    assert s1_new.solvent == s1.solvent
-    assert s1_new._engine == s1._engine
-    # the solutions should point to different EOS instances
-    assert s1_new.engine != s1.engine
-    # also should point to different Store instances
-    # TODO currently this test will fail due to a bug in maggma's __eq__
-    # assert s1_new.database != s1.database
-
+    assert_roundtrip(s1, loadfn(str(tmp_path / "s1.json")))
     dumpfn(s2, str(tmp_path / "s2.json"))
-    s2_new = loadfn(str(tmp_path / "s2.json"))
-    assert s2_new.volume == s2.volume
-    # components concentrations should be the same
-    assert s2_new.components == s2.components
-    # but not point to the same instances
-    assert s2_new.components is not s2.components
-    assert s2_new.get_total_moles_solute() == s2.get_total_moles_solute()
-    assert np.isclose(s2_new.pH, s2.pH)
-    assert np.isclose(s2_new._pH, s2._pH)
-    assert np.isclose(s2_new.pE, s2.pE)
-    assert np.isclose(s2_new._pE, s2._pE)
-    assert s2_new.temperature == s2.temperature
-    assert s2_new.pressure == s2.pressure
-    assert s2_new.solvent == s2.solvent
-    assert s2_new._engine == s2._engine
-    # the solutions should point to different EOS instances
-    assert s2_new.engine != s2.engine
-    # also should point to different Store instances
-    # TODO currently this test will fail due to a bug in maggma's __eq__
-    # assert s2_new.database != s2.database
+    assert_roundtrip(s2, loadfn(str(tmp_path / "s2.json")))
 
 
-def test_from_preset(tmp_path):
-    from monty.serialization import dumpfn
+def test_serialization_engine_instance(tmp_path):
+    """A Solution created by passing an EOS *instance* (rather than a name) to the engine kwarg
+    should serialize: because EOS subclasses MSONable, as_dict stores the engine as a serialized
+    MSONable dict that round-trips to the same engine type (and constructor arguments)."""
+    for eos, name in [(IdealEOS(), "ideal"), (NativeEOS(), "native")]:
+        s = Solution({"Na+": "1 mol/L", "Cl-": "1 mol/L"}, engine=eos)
+        d = s.as_dict()
+        # the engine is serialized as a full MSONable dict, not merely its name
+        assert isinstance(d["engine"], dict)
+        assert d["engine"]["@class"] == type(eos).__name__
+        assert d["engine"]["@module"] == "pyEQL.engines"
 
-    preset_name = "seawater"
-    solution = Solution.from_preset(preset_name)
-    with open(os.path.join("src/pyEQL/presets", f"{preset_name}.yaml")) as file:
+        # full round-trip through monty JSON serialization
+        dumpfn(s, str(tmp_path / f"s_{name}.json"))
+        restored = loadfn(str(tmp_path / f"s_{name}.json"))
+        assert isinstance(restored, Solution)
+        assert type(restored.engine) is type(s.engine)
+        assert restored.engine.as_dict() == s.engine.as_dict()
+        assert restored.components == s.components
+
+
+def test_serialization_engine_backward_compat():
+    """Older serialized Solutions stored the engine as a plain string name (e.g. "native"). Those
+    dicts must still load, with __init__ resolving the name to the corresponding EOS instance."""
+    for name, cls in [("ideal", IdealEOS), ("native", NativeEOS)]:
+        d = Solution({"Na+": "1 mol/L", "Cl-": "1 mol/L"}, engine=name).as_dict()
+        # simulate a legacy dict that stored only the engine name
+        d["engine"] = name
+        restored = Solution.from_dict(d)
+        assert type(restored.engine) is cls
+
+
+@pytest.mark.parametrize("ext", ["yaml", "json"])
+def test_from_file_engine_roundtrip_and_override(tmp_path, ext):
+    """A Solution created with a non-default EOS *instance* round-trips through to_file / from_file for
+    both file types, preserving the engine type. Override kwargs passed to from_file replace values
+    stored in the file (here, swapping the engine)."""
+    s = Solution({"Na+": "1 mol/L", "Cl-": "1 mol/L"}, engine=IdealEOS())
+    path = str(tmp_path / f"s.{ext}")
+    s.to_file(path)
+
+    restored = Solution.from_file(path)
+    assert isinstance(restored, Solution)
+    assert type(restored.engine) is IdealEOS
+    assert restored.components == s.components
+
+    # kwargs passed to from_file override the value stored in the file
+    overridden = Solution.from_file(path, engine="native")
+    assert type(overridden.engine) is NativeEOS
+    assert overridden.components == s.components
+
+
+def test_from_file_new_monty_returns_solution_directly(tmp_path, monkeypatch):
+    """monty >= 2026.7.16 makes loadfn reconstruct a serialized file directly into a Solution (older
+    monty returns a plain dict for YAML). Simulate that so the Solution branch of from_file is covered
+    on any installed monty: with no override kwargs the loaded Solution is returned as-is (same object);
+    with kwargs it is re-serialized and rebuilt so the overrides take effect."""
+    s = Solution({"Na+": "1 mol/L", "Cl-": "1 mol/L"}, engine=IdealEOS())
+    path = str(tmp_path / "s.yaml")
+    s.to_file(path)
+
+    # a stand-in for the fully reconstructed Solution that newer monty's loadfn would return. Build it
+    # directly (not via loadfn, whose return type depends on the installed monty version).
+    sentinel = Solution.from_dict(s.as_dict())
+    monkeypatch.setattr(solution_module, "loadfn", lambda *args, **kwargs: sentinel)
+
+    # no kwargs: the reconstructed Solution is returned directly, untouched
+    assert Solution.from_file(path) is sentinel
+
+    # kwargs: a new Solution is rebuilt with the overrides applied
+    overridden = Solution.from_file(path, engine="native")
+    assert overridden is not sentinel
+    assert type(overridden.engine) is NativeEOS
+
+
+@pytest.mark.parametrize("ext", ["yaml", "json"])
+def test_from_file_preserves_all_init_fields(tmp_path, ext):
+    """from_file must preserve every serialized __init__ field. default_diffusion_coeff and log_level
+    were silently dropped by an earlier key allowlist on the older-monty YAML path; both should now
+    survive a round-trip for both file types."""
+    s = Solution(
+        {"Na+": "1 mol/L", "Cl-": "1 mol/L"},
+        default_diffusion_coeff=5e-10,
+        log_level="DEBUG",
+    )
+    # sanity check that these differ from the __init__ defaults, so the assertions are meaningful
+    assert s.default_diffusion_coeff != 1.6106e-9
+    assert s.log_level != "ERROR"
+
+    path = str(tmp_path / f"s.{ext}")
+    s.to_file(path)
+    restored = Solution.from_file(path)
+    assert restored.default_diffusion_coeff == 5e-10
+    assert restored.log_level == "DEBUG"
+
+
+@pytest.mark.parametrize(
+    "preset_name",
+    [
+        "seawater",
+        "ash",
+        "batt_mfg",
+        "batt_recycling",
+        "coal_washing",
+        "CRL",
+        "drilling",
+        "excavation",
+        "FGD",
+        "flotation",
+        "waste_gas",
+        "gasification",
+        "geothermal",
+        "leachate",
+        "mine_drainage",
+        "mine_tailings",
+        "plating",
+        "pw_conv",
+        "pw_unconv",
+        "refining",
+        "semiconductor",
+        "smelting",
+        "tanning",
+    ],
+)
+def test_from_preset(preset_name, tmp_path):
+    solution_yaml = Solution.from_preset(preset_name)
+    preset_path = files("pyEQL") / "presets" / f"{preset_name}.yaml"
+
+    with open(str(preset_path)) as file:
         data = yaml.load(file, Loader=yaml.FullLoader)
-    # test valid preset
-    assert isinstance(solution, Solution)
-    assert solution.temperature.to("degC") == ureg.Quantity(data["temperature"])
-    assert solution.pressure == ureg.Quantity(data["pressure"])
-    assert np.isclose(solution.pH, data["pH"], atol=0.01)
-    for solute in solution._solutes:
-        assert solute in data["solutes"]
+    assert isinstance(solution_yaml, Solution)
+    assert solution_yaml.temperature.to("degC") == ureg.Quantity(data["temperature"])
+    assert solution_yaml.pressure == ureg.Quantity(data["pressure"])
+    assert set(solution_yaml.components) == set(data["solutes"])
+    # solvent mass and pH are set on __init__, but get overwritten with the values
+    # from the file. Check that this happens correctly.
+    assert np.isclose(solution_yaml.pH, data["pH"], atol=0.0001)
+    assert np.isclose(solution_yaml.components["H2O(aq)"], float(data["solutes"]["H2O(aq)"].split(" ")[0]), atol=1e-7)
+    assert np.isclose(solution_yaml.volume.magnitude, ureg.Quantity(data["volume"]).magnitude)
     # test invalid preset
     with pytest.raises(FileNotFoundError):
         Solution.from_preset("nonexistent_preset")
     # test json as preset
     json_preset = tmp_path / "test.json"
-    dumpfn(solution, json_preset)
+    dumpfn(solution_yaml, json_preset)
     solution_json = Solution.from_preset(tmp_path / "test")
     assert isinstance(solution_json, Solution)
     assert solution_json.temperature.to("degC") == ureg.Quantity(data["temperature"])
     assert solution_json.pressure == ureg.Quantity(data["pressure"])
-    assert np.isclose(solution_json.pH, data["pH"], atol=0.01)
+    assert np.isclose(solution_json.volume.magnitude, ureg.Quantity(data["volume"]).magnitude)
+    assert np.isclose(solution_json.pH, data["pH"], atol=0.0001)
 
 
-def test_to_from_file(tmp_path, s1):
+def test_to_from_file(tmp_path):
+    s1 = Solution({"Mg+2": "0.1 mol/L", "Cl-": "0.2 mol/L"}, volume="2 L", pH=5)
+    s1.equilibrate()
     for f in ["test.json", "test.yaml"]:
         filename = tmp_path / f
         s1.to_file(filename)
         assert filename.exists()
         loaded_s1 = Solution.from_file(filename)
-        assert loaded_s1 is not None
-        assert pytest.approx(loaded_s1.volume.to("L").magnitude) == s1.volume.to("L").magnitude
+        assert isinstance(loaded_s1, Solution)
+        assert np.isclose(loaded_s1.volume.to("L").magnitude, s1.volume.to("L").magnitude)
+        assert np.isclose(loaded_s1.pH, s1.pH, atol=0.0001)
+        assert np.isclose(loaded_s1.solvent_mass.magnitude, s1.solvent_mass.magnitude)
+        assert set(loaded_s1.components) == set(s1.components)
     # test invalid extension raises error
     filename = tmp_path / "test_solution.txt"
     with pytest.raises(ValueError, match=r"File extension must be .json or .yaml"):
         s1.to_file(filename)
     with pytest.raises(FileNotFoundError, match=r"File .* not found!"):
         Solution.from_file(filename)
+
+
+"""
+The section below generates values to be used for test parametrization.
+"""
+
+_CATIONS = []
+_ANIONS = []
+
+for doc in pyEQL.IonDB.query(criteria={"size.molar_volume": {"$ne": None}}):
+    if doc["charge"] > 0:
+        _CATIONS.append(doc["formula"])
+    elif doc["charge"] < 0:
+        _ANIONS.append(doc["formula"])
+
+_fill_value = _CATIONS[0] if len(_CATIONS) < len(_ANIONS) else _ANIONS[0]
+# These cation-anion pairs include all ions for which molar volumes are available
+_SOLUTES = list(zip_longest(_CATIONS, _ANIONS, fillvalue=_fill_value))
+_FORMULAS_TO_SALTS = {f"{Salt(anion, cation).formula}(aq)": Salt(anion, cation) for anion, cation in _SOLUTES}
+_criteria = {
+    "model_parameters.molar_volume_pitzer.Beta0": {"$ne": None},
+    "charge": 0.0,
+    "formula": {"$in": list(_FORMULAS_TO_SALTS)},
+}
+# These salts include all salts for which Pitzer molar volume parameters are available
+_SALTS = [_FORMULAS_TO_SALTS[doc["formula"]] for doc in pyEQL.IonDB.query(criteria=_criteria)]
+
+
+@pytest.fixture(name="salt", params=_SOLUTES)
+def fixture_salt(request: pytest.FixtureRequest) -> Salt:
+    cation, anion = request.param
+    return Salt(cation=cation, anion=anion)
+
+
+def _get_solute_volume(
+    ionic_strength: float,
+    conc: Quantity,
+    alphas: tuple[float, float],
+    param: dict[str, dict[str, Quantity]],
+    salt: Salt,
+    temp: str,
+) -> float:
+    return ac.get_apparent_volume_pitzer(
+        ionic_strength,
+        conc,
+        alphas[0],
+        alphas[1],
+        ureg.Quantity(param["Beta0"]["value"]).magnitude,
+        ureg.Quantity(param["Beta1"]["value"]).magnitude,
+        ureg.Quantity(param["Beta2"]["value"]).magnitude,
+        ureg.Quantity(param["Cphi"]["value"]).magnitude,
+        ureg.Quantity(param["V_o"]["value"]).magnitude,
+        salt.z_cation,
+        salt.z_anion,
+        salt.nu_cation,
+        salt.nu_anion,
+        temp,
+    )
+
+
+class TestSolutionAdd:
+    @staticmethod
+    @pytest.fixture(name="salt_conc", params=[0.0, 1.0, 2.0])
+    def fixture_salt_conc(request: pytest.FixtureRequest) -> float:
+        return float(request.param)
+
+    @staticmethod
+    @pytest.fixture(name="engine", params=["ideal", "native", "phreeqc"])
+    def fixture_engine(request: pytest.FixtureRequest) -> str:
+        return str(request.param)
+
+    @staticmethod
+    @pytest.fixture(name="solution_sum")
+    def fixture_solution_sum(solution: Solution) -> Solution:
+        return solution + solution
+
+    @staticmethod
+    @pytest.mark.parametrize("engine", ["ideal"])
+    def test_should_conserve_volume_with_ideal_engine(solution: Solution, solution_sum: Solution) -> None:
+        assert np.isclose(solution_sum.volume.m, 2 * solution.volume.m)
+
+    @staticmethod
+    def test_should_preserve_engine_when_adding_solutions(solution: Solution, solution_sum: Solution) -> None:
+        assert solution._engine == solution_sum._engine
+
+    @staticmethod
+    def test_should_preserve_the_number_of_moles_when_adding_solutions(
+        solution: Solution, solution_sum: Solution
+    ) -> None:
+        moles_conserved = []
+        for component, moles in solution.components.items():
+            moles_conserved.append(solution_sum.components[component] == 2 * moles)
+        assert all(moles_conserved)
+
+    @staticmethod
+    def test_should_add_all_components_to_new_solution(solution: Solution, solution_sum: Solution) -> None:
+        assert sorted(solution.components) == sorted(solution_sum.components)
+
+    @staticmethod
+    def test_should_preserve_solution_solvent(solution: Solution, solution_sum: Solution) -> None:
+        assert solution.solvent == solution_sum.solvent
+
+    @staticmethod
+    def test_should_preserve_solution_database(solution: Solution, solution_sum: Solution) -> None:
+        assert solution.database == solution_sum.database
+
+    @staticmethod
+    @pytest.mark.parametrize("engine", ["native"])
+    @pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
+    def test_should_replace_monatomic_species_from_engine(engine, caplog) -> None:
+        # When initializing a solution without specifying the charge on the ion,
+        # `.equilibrate()` should replace the ion with the ion with the charge
+        # defined in the phreeqc database.
+        solution = Solution({"Na": "1 mg/L"}, balance_charge="auto", engine=engine)
+        assert "Na(aq)" in solution.components
+        assert "Na[+1]" not in solution.components
+        orig_el_amount = solution.get_total_amount("Na", "mol")
+
+        with caplog.at_level(logging.INFO, "pyEQL"):
+            solution.equilibrate()
+
+        assert "amounts of species ['Na(aq)'] were not modified by PHREEQC" in caplog.text
+        assert "Na[+1]" in solution.components  # correct charge assignment
+        assert "Na(aq)" not in solution.components
+        new_el_amount = solution.get_total_amount("Na", "mol")
+
+        assert np.isclose(new_el_amount, orig_el_amount)
+
+    @staticmethod
+    @pytest.mark.parametrize("engine", ["native"])
+    @pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
+    def test_should_replace_diatomic_species_from_engine(engine, caplog) -> None:
+        # When initializing a solution by specifying the charge on the ion
+        # that is different from the one determined by phreeqc,
+        # `.equilibrate()` should replace the ion with the ion with the charge
+        # determined by phreeqc.
+        solution = Solution({"ReO4-2": "0.001 mg/L"}, balance_charge="auto", engine=engine)
+        assert "ReO4[-2]" in solution.components
+        assert "ReO4[-1]" not in solution.components
+        orig_el_amount = solution.get_total_amount("Re", "mol")
+
+        with caplog.at_level(logging.INFO, "pyEQL"):
+            solution.equilibrate()
+
+        # [ReO4-2] is not in phreeqc, but the element Re[+7] is, so it comes
+        # up with ReO4[-1] as the species and replaces our incorrect ReO4[-2].
+        assert "amounts of species ['ReO4[-2]'] were not modified by PHREEQC" in caplog.text
+        assert "ReO4[-1]" in solution.components
+        assert "ReO4[-2]" not in solution.components
+        new_el_amount = solution.get_total_amount("Re", "mol")
+
+        assert np.isclose(new_el_amount, orig_el_amount)
+
+    @staticmethod
+    @pytest.mark.parametrize("engine", ["native"])
+    @pytest.mark.skipif(not PHREEQPYTHON_AVAILABLE, reason="Phreeqpython not available")
+    def test_should_not_discard_missing_species_from_engine(engine, caplog) -> None:
+        # When initializing a solution by specifying a species with an element
+        # that is not found in phreeqc, the species should not be discarded.
+        solution = Solution({"Rh+3": "0.001 mg/L", "Rh2O3": "0.001 mg/L"}, balance_charge="auto", engine=engine)
+        assert "Rh[+3]" in solution.components
+        assert "Rh2O3(aq)" in solution.components
+        orig_el_amount = solution.get_total_amount("Rh", "mol")
+
+        with caplog.at_level(logging.INFO, "pyEQL"):
+            solution.equilibrate()
+
+        assert "amounts of species ['Rh2O3(aq)', 'Rh[+3]'] were not modified by PHREEQC" in caplog.text
+        assert (
+            "PHREEQC discarded element Rh during equilibration. Adding all components for this element." in caplog.text
+        )
+        assert "Rh[+3]" in solution.components  # still there
+        assert "Rh2O3(aq)" in solution.components  # still there
+        new_el_amount = solution.get_total_amount("Rh", "mol")
+
+        assert np.isclose(new_el_amount, orig_el_amount)
+
+
+class TestZeroSoluteVolume:
+    @staticmethod
+    @pytest.mark.parametrize("engine", ["ideal"])
+    def test_should_return_zero_solute_volume_for_ideal_engine(solution: Solution) -> None:
+        assert solution._get_solute_volume() == 0.0
+
+
+class TestLinearCombinationSoluteVolume:
+    @staticmethod
+    @pytest.mark.parametrize(("salt_conc", "salt_conc_units"), [(1e-7, "mol/kg")])
+    def test_should_return_solute_volume_equal_to_linear_combination_of_molar_solute_volumes_for_dilute_solutions(
+        solution: Solution,
+    ) -> None:
+        sum_of_molar_volumes = ureg.Quantity(0.0, "L")
+
+        for solute, component in solution.components.items():
+            if solute != solution.solvent:
+                molar_volume = solution.get_property(solute, "size.molar_volume")
+                sum_of_molar_volumes += ureg.Quantity(component, "mol") * molar_volume
+
+        assert solution._get_solute_volume().m == sum_of_molar_volumes.m
+
+    @staticmethod
+    @pytest.mark.parametrize("salt", _SALTS)
+    def test_should_log_debug_message_when_using_pitzer_model(
+        solution: Solution, salt: Salt, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger=solution.logger.name)
+        _ = solution._get_solute_volume()
+        expected_record = (
+            engines.logger.name,
+            logging.DEBUG,
+            f"Updated solution volume using Pitzer model for solute {salt.formula}",
+        )
+        assert expected_record in caplog.record_tuples
+
+    @staticmethod
+    @pytest.mark.parametrize("salt", _SALTS)
+    @pytest.mark.parametrize("salt_conc_units", ["mol/kg"])
+    def test_should_use_major_salt_molar_volume_to_calculate_solute_volume_when_parameters_exist(
+        solution: Solution, salt: Salt, salt_conc: float, salt_conc_units: str, alphas: tuple[float, float], volume: str
+    ) -> None:
+        param = solution.get_property(salt.formula, "model_parameters.molar_volume_pitzer")
+        conc = ureg.Quantity(salt_conc, salt_conc_units)
+        molality = (1 / 2) * (salt.nu_cation + salt.nu_anion) * conc
+        expected_solute_volume = (
+            _get_solute_volume(
+                solution.ionic_strength,
+                molality,
+                alphas,
+                param,
+                salt,
+                str(solution.temperature),
+            )
+            * conc
+            * solution.solvent_mass
+        ).to("L")
+        solute_volume_without_protons_and_hydroxide = solution._get_solute_volume().to("L")
+
+        if salt.cation != "H[+1]":
+            solute_volume_without_protons_and_hydroxide -= solution.get_amount("H+", "mol") * solution.get_property(
+                "H+", "size.molar_volume"
+            )
+        if salt.anion != "OH[-1]":
+            solute_volume_without_protons_and_hydroxide -= solution.get_amount("OH-", "mol") * solution.get_property(
+                "OH-", "size.molar_volume"
+            )
+        assert solute_volume_without_protons_and_hydroxide.m == expected_solute_volume.m
+
+
+@pytest.mark.parametrize("engine", ["native", "phreeqc", "phreeqc2026"])
+class TestSaturationIndex:
+    @staticmethod
+    def test_halite_si_over(engine, monkeypatch):
+        monkeypatch.setattr(go.Figure, "show", lambda self: None)
+        solution = Solution({"Na+": "10 mol/L", "K+": "10 mol/L", "Cl-": "10 mol/L"}, engine=engine)
+        si = solution.get_saturation_index()
+        assert si["Halite"] > 0.01
+        si_plot = solution.get_saturation_index(get_plot=True)
+        assert isinstance(si_plot, dict)
+        values = list(si.values())
+        assert values == sorted(values, reverse=True)
+
+    def test_halite_si_under(self, engine, monkeypatch):
+        solution = Solution({"Na+": "0.001 mol/L", "Cl-": "0.001 mol/L"}, engine=engine)
+        si = solution.get_saturation_index()
+        assert si["Halite"] < -0.01
+
+    def test_halite_si_near(self, engine, monkeypatch):
+        solution = Solution({"Na+": "6 mol/L", "Cl-": "6 mol/L"}, engine=engine)
+        si = solution.get_saturation_index()
+        assert -0.5 < si["Halite"] < 0.0
+
+    def test_calcite_si_matches_phreeqc(self, engine, monkeypatch):
+        from pyEQL.engines import Phreeqc2026EOS, PhreeqcEOS  # noqa: PLC0415
+
+        monkeypatch.setattr(go.Figure, "show", lambda self: None)
+        phreeqc_eos = PhreeqcEOS(phreeqc_db="phreeqc.dat")
+        phreeqc2026_eos = Phreeqc2026EOS(phreeqc_db="phreeqc.dat")
+        composition = {"Ca2+": "2 mmol/L", "CO3-2": "2 mmol/L", "H+": "10**(-10.3) mol/L"}
+
+        phreeqc_si = Solution(composition, engine=phreeqc_eos).get_saturation_index()
+        phreeqc2026_si = Solution(composition, engine=phreeqc2026_eos).get_saturation_index()
+        assert pytest.approx(phreeqc2026_si["Calcite"], rel=1e-3, abs=1e-3) == phreeqc_si["Calcite"]
+        assert phreeqc_si["Calcite"] == pytest.approx(2.14, rel=1e-2, abs=1e-2)
+        assert phreeqc2026_si["Calcite"] == pytest.approx(2.14, rel=1e-2, abs=1e-2)
+
+    def test_saturation_index_ideal_not_supported(self, engine, monkeypatch):
+        solution = Solution({"Na+": "1 mol/L", "Cl-": "1 mol/L"}, engine="ideal")
+        with pytest.raises(NotImplementedError):
+            solution.get_saturation_index()
+
+    # @pytest.mark.skip(reason="temporarily disabled")
+    def test_multi_equilibrate_si(self, engine, monkeypatch):
+        monkeypatch.setattr(go.Figure, "show", lambda self: None)
+        solution = Solution(
+            {"Na+": "10 mol/L", "K+": "10 mol/L", "Ca2+": "0.05 mol/L", "Cl-": "10 mol/L", "CO3-2": "0.05 mol/L"},
+            engine="native",
+        )
+        si = solution.get_saturation_index()
+        assert isinstance(si, dict)
+        assert "Halite" in si
+        assert "Calcite" in si
+        assert len(si) >= 2
+        solution.equilibrate()
+        assert 0 < si["Halite"] < 1
+        assert 0 < si["Calcite"] < 1

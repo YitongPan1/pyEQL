@@ -4,7 +4,7 @@
 
 ## Use a conda environment
 
-We highly recommend installing python in an isolated environment using [`conda`](https://docs.conda.io/en/latest/) (or its speedier, backward-compatible successor, [mamba](https://mamba.readthedocs.io/en/latest/)). In particular, we recommend the [miniforge](https://github.com/conda-forge/miniforge#miniforge3) or [mambaforge](https://github.com/conda-forge/miniforge#mambaforge) distributions of Python, which are lightweight distributions of conda that automatically activate the `conda-forge` channel for up-to-date scientific packages.
+We highly recommend installing python in an isolated environment using [`conda`](https://docs.conda.io/en/latest/) (or its speedier, backward-compatible successor, [mamba](https://mamba.readthedocs.io/en/latest/)). In particular, we recommend the [miniforge](https://github.com/conda-forge/miniforge) distributions of Python, which are lightweight distributions of conda that automatically activate the `conda-forge` channel for up-to-date scientific packages.
 
 ```{note}
 If you are on a Windows machine, we recommend you install the [Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/install) and set up your conda environments inside the WSL environment.
@@ -14,12 +14,12 @@ After installing `conda` / `mamba`, follow their instructions to create an envir
 
 1. Open your terminal (or "Anaconda prompt" or "Miniforge prompt" on Windows)
 2. Pick a name for your environment (note: you can create many environments if you want)
-3. type `conda create -n <name-you-picked> python=3.10` (if you install miniforge) or `mamba create -n <name-you-picked> python=3.10` (if you installed mambaforge) and press enter
+3. type `conda create -n <name-you-picked> python=3.13` (if you install miniforge) or `mamba create -n <name-you-picked> python=3.13` (if you installed mambaforge) and press enter
 4. After the environment is installed, type `conda activate <name-you-picked>` / `mamba activate <name-you-picked>` and press enter
 
 ## pip install
 
-Once Python is installed and your environment is activated you can install `pyEQL` from [PyPi](https://pypi.python.org/pypi) by typing the following command:
+Once Python is installed and your environment is activated you can install `pyEQL` from [PyPi](https://pypi.org/) by typing the following command:
 
 ```
 pip install pyEQL
@@ -68,10 +68,10 @@ pyEQL also requires the following packages:
 - [pint](https://github.com/hgrecco/pint) - for automated unit conversion
 - [pymatgen](https://github.com/materialsproject/pymatgen/) - used to interpret chemical formulas
 - [iapws](https://github.com/jjgomera/iapws/) - used to calculate the properties of water
-- [monty](https://github.com/materialsvirtuallab/monty) - used for saving and loading `Solution` objects to files
+- [monty](https://github.com/materialyzeai/monty) - used for saving and loading `Solution` objects to files
 - [maggma](https://materialsproject.github.io/maggma/) - used by the internal property database
-- [scipy](http://scipy.org/)
-- [numpy](http://numpy.org/)
+- [scipy](https://scipy.org/)
+- [numpy](https://numpy.org/)
 
 If you use pip to install pyEQL (recommended), they should be installed automatically.
 

@@ -97,17 +97,17 @@ def entropy_mix(solution1: Solution, solution2: Solution):
 
             \Delta_{mix} S = \sum_i {(n_c + n_d) R \ln x_b} - \sum_i {n_c R \ln x_c} - \sum_i {n_d R \ln x_d}
 
-        Where :math:`n` is the number of moles of substance, :math:`T` is the temperature in kelvin, :math:`x` is the mole fraction of solute :math:`i`,
-        and  subscripts :math:`b`, :math:`c`, and :math:`d` refer to the concentrated, dilute, and blended
-        Solutions, respectively.
+        Where :math:`n` is the number of moles of substance, :math:`T` is the temperature in kelvin, :math:`x` is the
+        mole fraction of solute :math:`i`, and  subscripts :math:`b`, :math:`c`, and :math:`d` refer to the
+        concentrated, dilute, and blended Solutions, respectively.
 
         Note that dissociated ions must be counted as separate components,
         so a simple salt dissolved in water is a three component solution (cation,
         anion, and water).
 
     References:
-        Koga, Yoshikata, 2007. *Solution Thermodynamics and its Application to Aqueous Solutions:
-            A differential approach.* Elsevier, 2007, pp. 23-37.
+        Koga, Yoshikata, 2007. *Solution Thermodynamics and its Application to Aqueous Solutions: *
+        *A differential approach.* Elsevier, 2007, pp. 23-37.
 
     """
     concentrate = solution1
@@ -261,7 +261,7 @@ def donnan_eql(solution: Solution, fixed_charge: str):
 
     # solve the function above using one of scipy's nonlinear solvers
 
-    from scipy.optimize import brentq
+    from scipy.optimize import brentq  # noqa: PLC0415
 
     # determine which ion concentration represents the co-ion
     # call a nonlinear solver to adjust the concentrations per the donnan

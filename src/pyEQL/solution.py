@@ -27,15 +27,35 @@ from pymatgen.core.ion import Ion
 
 from pyEQL import IonDB, ureg
 from pyEQL.activity_correction import _debye_parameter_activity, _debye_parameter_B
-from pyEQL.engines import EOS, IdealEOS, NativeEOS, PhreeqcEOS
+from pyEQL.engines import EOS, IdealEOS, NativeEOS, Phreeqc2026EOS, PhreeqcEOS
 from pyEQL.salt_ion_match import Salt
 from pyEQL.solute import Solute
-from pyEQL.utils import FormulaDict, create_water_substance, interpret_units, standardize_formula
+from pyEQL.utils import (
+    FormulaDict,
+    _translate_pint_quantity,
+    create_water_substance,
+    standardize_formula,
+    translate_units,
+)
 
 EQUIV_WT_CACO3 = ureg.Quantity(100.09 / 2, "g/mol")
 # string to denote unknown oxidation states
 UNKNOWN_OXI_STATE = "unk"
 K_W = 1e-14  # ion product of water at 25 degC
+
+# the following properties will be pre-cached for all solutes in the solution, to speed up property retrieval during calculations.
+CORE_PROPERTIES = [
+    "formula",
+    "name",
+    "charge",
+    "molecular_weight",
+    "size.molar_volume",
+    "oxi_state_guesses",
+    "elements",
+    "pmg_ion",
+    "model_parameters",
+    "transport.diffusion_coefficient",
+]
 
 
 class Solution(MSONable):
@@ -54,12 +74,12 @@ class Solution(MSONable):
         pE: float = 8.5,
         balance_charge: str | None = None,
         solvent: str | list = "H2O",
-        engine: EOS | Literal["native", "ideal", "phreeqc"] = "native",
+        engine: EOS | Literal["native", "ideal", "phreeqc", "phreeqc2026"] = "native",
         database: str | Path | Store | None = None,
         default_diffusion_coeff: float = 1.6106e-9,
         log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | None = "ERROR",
     ) -> None:
-        """
+        r"""
         Instantiate a Solution from a composition.
 
         Args:
@@ -88,32 +108,65 @@ class Solution(MSONable):
                 Negative log of H+ activity. If omitted, the solution will be
                 initialized to pH 7 (neutral) with appropriate quantities of
                 H+ and OH- ions
-            pE: the pE value (redox potential) of the solution.     Lower values = more reducing,
-                higher values = more oxidizing. At pH 7, water is stable between approximately
-                -7 to +14. The default value corresponds to a pE value typical of natural
+            pE: the :math:`pe` value of the solution. :math:`pe` measures the relative abundance of electrons
+                analogous to how pH measures the relative abundance of protons. Specifically, :math:`pe` is defined in
+                terms of the activity of electrons :math:`[e^{-}]`:
+
+                .. math:: pe = - \log [e^{-}]
+
+                The relationship between the redox potential :math:`Eh` and :math:`pe` can be illustrated by considering
+                the general redox reaction,
+
+                .. math::
+
+                    \begin{gather*}
+                        \text{A}^x \pm ne^{-} \longrightarrow \text{A}^{x \mp n} \quad\quad
+                        K = \frac{[\text{A}^{x \mp n}]}{[\text{A}^x][e^{-}]^{\pm n}}
+                    \end{gather*}
+
+                Writing :math:`pe` in terms of the equilibrium constant :math:`K` and the activities,
+                :math:`[\text{A}^{x}]` and :math:`[\text{A}^{x \mp n}]`, we have:
+
+                .. math::
+
+                    \begin{gather*}
+                        pe = -\log[e^{-}] = \mp \frac{1}{n} \log\left(\frac{1}{K} \frac{[\text{A}^{x \mp n}]}{[\text{A}^x]}\right)
+                           = \mp \frac{\Delta G}{nRT \ln 10} = \frac{FEh}{RT \ln 10}
+                    \end{gather*}
+
+                Thus, the redox potential :math:`Eh` is then related to :math:`pe` via:
+
+                .. math:: Eh = 2.303 \frac{RT}{F}pe
+
+                where :math:`F` is Faraday's constant. Note that lower values of ``pE`` (and thus :math:`Eh`)
+                correspond to more reducing environments, while higher values = more oxidizing. At pH 7, water is stable
+                between approximately -7 to +14. The default value corresponds to a :math:`pe` value typical of natural
                 waters in equilibrium with the atmosphere.
             balance_charge: The strategy for balancing charge during init and equilibrium calculations. Valid options
                 are
+
                     - 'pH', which will adjust the solution pH to balance charge,
                     - 'auto' which will use the majority cation or anion (i.e., that with the largest concentration)
-                    as needed,
+                      as needed,
                     - 'pE' (not currently implemented) which will adjust the redox equilibrium to balance charge, or
-                    the name of a dissolved species e.g. 'Ca+2' or 'Cl-' that will be added/subtracted to balance
-                    charge.
+                      the name of a dissolved species e.g. 'Ca+2' or 'Cl-' that will be added/subtracted to balance
+                      charge.
                     - None (default), in which case no charge balancing will be performed either on init or when
-                    equilibrate() is called. Note that in this case, equilibrate() can distort the charge balance!
+                      equilibrate() is called. Note that in this case, equilibrate() can distort the charge balance!
+
             solvent: Formula of the solvent. Solvents other than water are not supported at this time.
             engine: Electrolyte modeling engine to use. See documentation for details on the available engines.
             database: path to a .json file (str or Path) or maggma Store instance that
                 contains serialized SoluteDocs. `None` (default) will use the built-in pyEQL database.
             log_level: Log messages of this or higher severity will be printed to stdout. Defaults to 'ERROR', meaning
-                that ERROR and CRITICAL messages will be shown, while WARNING, INFO, and DEBUG messages are not. If set to None, nothing will be printed.
+                that ERROR and CRITICAL messages will be shown, while WARNING, INFO, and DEBUG messages are not. If set
+                to None, nothing will be printed.
             default_diffusion_coeff: Diffusion coefficient value in m^2/s to use in
                 calculations when there is no diffusion coefficient for a species in the database. This affects several
-                important property calculations including conductivity and transport number, which are related to the
+                important property calculations including conductivity and transference number, which are related to the
                 weighted sums of diffusion coefficients of all species. Setting this argument to zero will exclude any
                 species that does not have a tabulated diffusion coefficient from these calculations, possibly resulting
-                in underestimation of the conductivity and/or inaccurate transport numbers.
+                in underestimation of the conductivity and/or inaccurate transference numbers.
 
                 Missing diffusion coefficients are especially likely in complex electrolytes containing, for example,
                 complexes or paired species such as NaSO4[-1]. In such cases, setting default_diffusion_coeff  to zero
@@ -123,12 +176,14 @@ class Solution(MSONable):
 
         Examples:
             >>> s1 = pyEQL.Solution({'Na+': '1 mol/L','Cl-': '1 mol/L'},temperature='20 degC',volume='500 mL')
-            >>> print(s1)
-            Components:
+            >>> print(s1)  # doctest: +ELLIPSIS
             Volume: 0.500 l
-            Pressure: 1.000 atm
             Temperature: 293.150 K
-            Components: ['H2O(aq)', 'H[+1]', 'OH[-1]', 'Na[+1]', 'Cl[-1]']
+            Pressure: 1.000 atm
+            pH: 7.0
+            pE: 8.5
+            Solvent: H2O(aq)
+            Components: KeysView({'H2O(aq)': ..., 'Na[+1]': 0.5, 'Cl[-1]': 0.5, 'OH[-1]': ..., 'H[+1]': ...})
         """
         # create a logger and attach it to this class
         self.log_level = log_level.upper()
@@ -140,7 +195,7 @@ class Solution(MSONable):
             self.logger.handlers.clear()
             # use rich for pretty log formatting, if installed
             try:
-                from rich.logging import RichHandler
+                from rich.logging import RichHandler  # noqa: PLC0415
 
                 sh = RichHandler(rich_tracebacks=True)
             except ImportError:
@@ -153,7 +208,7 @@ class Solution(MSONable):
         # per-instance cache of get_property and other calls that do not depend
         # on composition
         # see https://rednafi.com/python/lru_cache_on_methods/
-        self.get_property = lru_cache()(self._get_property)
+        self.get_property = lru_cache(maxsize=8192)(self._get_property)
         self.get_molar_conductivity = lru_cache()(self._get_molar_conductivity)
         self.get_mobility = lru_cache()(self._get_mobility)
         self.default_diffusion_coeff = default_diffusion_coeff
@@ -162,13 +217,11 @@ class Solution(MSONable):
         # initialize the volume recalculation flag
         self.volume_update_required = False
 
-        # initialize the volume with a flag to distinguish user-specified volume
+        # initialize the volume
         if volume is not None:
-            # volume_set = True
             self._volume = ureg.Quantity(volume).to("L")
         else:
-            # volume_set = False
-            self._volume = ureg.Quantity(1, "L")
+            self._volume = 1 * ureg.L
         # store the initial conditions as private variables in case they are
         # changed later
         self._temperature = ureg.Quantity(temperature)
@@ -180,6 +233,10 @@ class Solution(MSONable):
             self.balance_charge = standardize_formula(balance_charge)
         else:
             self.balance_charge = balance_charge  #: Standardized formula of the species used for charge balancing.
+        # the actual charge-balancing species is determined further below, once the composition is
+        # known; initialize it here so the attribute always exists (e.g. if setting the pH triggers a
+        # PHREEQC ppsol build, which reads _cb_species, before that determination runs).
+        self._cb_species = None
 
         # instantiate a water substance for property retrieval
         self.water_substance = create_water_substance(self.temperature, self.pressure)
@@ -215,6 +272,8 @@ class Solution(MSONable):
             self.engine = NativeEOS()
         elif self._engine == "phreeqc":
             self.engine = PhreeqcEOS()
+        elif self._engine == "phreeqc2026":
+            self.engine = Phreeqc2026EOS()
         else:
             raise ValueError(f'{engine} is not a valid value for the "engine" kwarg!')
 
@@ -228,39 +287,65 @@ class Solution(MSONable):
         self.solvent = standardize_formula(solvent[0])
         """Formula of the component that is set as the solvent (currently only H2O(aq) is supported)."""
 
-        # TODO - do I need the ability to specify the solvent mass?
-        # # raise an error if the solvent volume has also been given
-        # if volume_set is True:
-        #     self.logger.error(
-        #         "Solvent volume and mass cannot both be specified. Calculating volume based on solvent mass."
-        #     )
-        # # add the solvent and the mass
-        # self.add_solvent(self.solvent, kwargs["solvent"][1])
-
-        # calculate the moles of solvent (water) on the density and the solution volume
-        moles = self.volume.magnitude / 55.55  # molarity of pure water
-        self.components["H2O"] = moles
-
-        # set the pH with H+ and OH-
-        self.add_solute("H+", str(10 ** (-1 * pH)) + "mol/L")
-        self.add_solute("OH-", str(K_W / (10 ** (-1 * pH))) + "mol/L")
-
-        # populate the other solutes
-        self._solutes = solutes
-        if self._solutes is None:
-            self._solutes = {}
-        if isinstance(self._solutes, dict):
-            for k, v in self._solutes.items():
-                self.add_solute(k, v)
-        elif isinstance(self._solutes, list):
+        # store the provided solutes as a dict
+        if isinstance(solutes, dict):
+            self._solutes = solutes
+        elif isinstance(solutes, list):
             msg = (
                 'List input of solutes (e.g., [["Na+", "0.5 mol/L]]) is deprecated! Use dictionary formatted input '
                 '(e.g., {"Na+":"0.5 mol/L"} instead.)'
             )
             self.logger.warning(msg)
             warnings.warn(msg, DeprecationWarning)
-            for item in self._solutes:
-                self.add_solute(*item)
+            self._solutes = {item[0]: item[1] for item in solutes}
+        elif solutes is None:
+            self._solutes = {}
+
+        # # pre-cache all the relevant properties of the solutes provided by the user
+        self._solute_data = list(
+            self.database.query({"formula": {"$in": list(self._solutes.keys())}}, properties=CORE_PROPERTIES)
+        )
+
+        if "H2O(aq)" in self._solutes:
+            self.components["H2O"] = ureg.Quantity(self._solutes["H2O(aq)"]).to("mol").magnitude
+        else:
+            # calculate the moles of solvent (water) based on the density and solution volume
+            self.components["H2O"] = (
+                self.volume.magnitude * 1000 * self.water_substance.rho / 18.01528
+            )  # moles = density / molar mass * volume
+
+        # set the pH with H+ and OH-
+        self.add_solute("H+", str(10 ** (-1 * pH)) + "mol/L")
+        self.add_solute("OH-", str(K_W / (10 ** (-1 * pH))) + "mol/L")
+
+        # populate remaining solutes
+        CHECK_H = False
+        CHECK_OH = False
+        for k, v in self._solutes.items():
+            self.add_solute(k, v)
+            # if user has specified H+ or OH- in solutes, that explicit amount governs and the
+            # pH argument is not used to (re)set the H+/OH- concentrations below
+            if standardize_formula(k) == "H[+1]":
+                CHECK_H = True
+            if standardize_formula(k) == "OH[-1]":
+                CHECK_OH = True
+
+        if CHECK_H:
+            # if user has not specified pH (default value), override the pH argument
+            if self._pH == 7:
+                self.logger.warning(f"H[+1] = {v} found in solutes. Overriding default pH with this value.")
+            # if user specifies non-default pH that does not match the supplied H+, raise an error
+            elif not np.isclose(self.pH, self._pH, atol=1e-4):
+                warnings.warn(
+                    f"After initialization, the calculated solution pH of {self.pH:.3f} does not match the "
+                    f"specified pH of {self._pH:.3f}. This might be a result of erroneous input (e.g., specifying "
+                    "both pH and H+), or it can happen during from_dict / from_preset if you use a different "
+                    "engine than the one which generated the original dict."
+                )
+        elif not CHECK_OH:
+            # neither H+ nor OH- was supplied explicitly, so the pH argument governs. Interpret it
+            # on the activity scale (like PHREEQC) and back-calculate the H+/OH- concentrations.
+            self._solve_pH(pH)
 
         # determine the species that will be used for charge balancing, when needed.
         # this is necessary to do even if the composition is already electroneutral,
@@ -291,6 +376,9 @@ class Solution(MSONable):
         # adjust charge balance, if necessary
         self._adjust_charge_balance()
 
+        # validate water stability, if necessary
+        self._check_water_stability()
+
     @property
     def mass(self) -> Quantity:
         """
@@ -302,7 +390,7 @@ class Solution(MSONable):
 
         """
         mass = np.sum([self.get_amount(item, "kg").magnitude for item in self.components])
-        return ureg.Quantity(mass, "kg")
+        return mass * ureg.kg
 
     @property
     def solvent_mass(self) -> Quantity:
@@ -347,13 +435,6 @@ class Solution(MSONable):
             >>> mysol = Solution([['Na+','2 mol/L'],['Cl-','0.01 mol/L']],volume='500 mL')
             >>> print(mysol.volume)
             0.5000883925072983 l
-            >>> mysol.list_concentrations()
-            {'H2O': '55.508435061791985 mol/kg', 'Cl-': '0.00992937605907076 mol/kg', 'Na+': '2.0059345573880325 mol/kg'}
-            >>> mysol.volume = '200 mL')
-            >>> print(mysol.volume)
-            0.2 l
-            >>> mysol.list_concentrations()
-            {'H2O': '55.50843506179199 mol/kg', 'Cl-': '0.00992937605907076 mol/kg', 'Na+': '2.0059345573880325 mol/kg'}
 
         """
         # figure out the factor to multiply the old concentrations by
@@ -415,11 +496,20 @@ class Solution(MSONable):
         self.volume_update_required = True
 
     @property
-    def pH(self) -> float | None:
-        """Return the pH of the solution."""
-        return self.p("H+", activity=False)
+    def pH(self) -> float:
+        """Return the pH of the solution.
 
-    def p(self, solute: str, activity=True) -> float | None:
+        pH is defined thermodynamically as the negative log10 of the hydrogen ion
+        *activity* (not concentration). Using the activity is important for
+        consistency with the equilibrium engines (e.g. PHREEQC), which interpret the
+        pH they are given as -log10(a_H+). Reporting a concentration-based pH here
+        while feeding it back into the engine as an activity-based pH caused a
+        systematic, non-convergent drift in pH (and hence mass and volume) on
+        repeated calls to equilibrate(). See GitHub issue #434.
+        """
+        return self.p("H+", activity=True)
+
+    def p(self, solute: str, activity=True) -> float:
         """
         Return the negative log of the activity of solute.
 
@@ -435,19 +525,18 @@ class Solution(MSONable):
         Returns:
             Quantity
                 The negative log10 of the activity (or molar concentration if
-                activity = False) of the solute.
+                activity = False) of the solute. If the solute has zero concentration
+                then np.nan (not a number) is returned.
         """
         try:
-            # TODO - for some reason this specific method requires the use of math.log10 rather than np.log10.
-            # Using np.exp raises ZeroDivisionError
-            import math
-
             if activity is True:
-                return -1 * math.log10(self.get_activity(solute))
-            return -1 * math.log10(self.get_amount(solute, "mol/L").magnitude)
-        # if the solute has zero concentration, the log will generate a ValueError
-        except ValueError:
-            return 0
+                amt = self.get_activity(solute).magnitude
+            else:
+                amt = self.get_amount(solute, "mol/L").magnitude
+            return float(-1 * np.log10(amt))
+        # if the solute has zero or negative concentration, np.log10 raises a RuntimeWarning
+        except RuntimeWarning:
+            return np.nan
 
     @property
     def density(self) -> Quantity:
@@ -465,9 +554,6 @@ class Solution(MSONable):
     def dielectric_constant(self) -> Quantity:
         r"""
         Returns the dielectric constant of the solution.
-
-        Args:
-            None
 
         Returns:
             Quantity: the dielectric constant of the solution, dimensionless.
@@ -503,7 +589,7 @@ class Solution(MSONable):
                 #     self.logger.warning("No dielectric parameters found for species %s." % item)
                 # continue
 
-        return ureg.Quantity(di_water / denominator, "dimensionless")
+        return ureg.Quantity(di_water / denominator)
 
     @property
     def chemical_system(self) -> str:
@@ -624,7 +710,7 @@ class Solution(MSONable):
         a0 = a1 = b0 = b1 = 0
 
         # retrieve the parameters for the delta G equations
-        params = self.get_property(salt.formula, "model_parameters.viscosity_eyring")
+        params = None if salt is None else self.get_property(salt.formula, "model_parameters.viscosity_eyring")
         if params is not None:
             a0 = ureg.Quantity(params["a0"]["value"]).magnitude
             a1 = ureg.Quantity(params["a1"]["value"]).magnitude
@@ -635,11 +721,16 @@ class Solution(MSONable):
             temperature = self.temperature.to("degC").magnitude
             G_123 = a0 + a1 * (temperature) ** 0.75
             G_23 = b0 + b1 * (temperature) ** 0.5
+
+            # calculate the cation mole fraction
+            # x_cat = self.get_amount(cation, "fraction")
+            x_cat = self.get_amount(salt.cation, "fraction").magnitude
         else:
             # TODO - fall back to the Jones-Dole model! There are currently no eyring parameters in the database!
             # proceed with the coefficients equal to zero and log a warning
-            self.logger.warning(f"Viscosity coefficients for {salt.formula} not found. Viscosity will be approximate.")
+            self.logger.warning("Appropriate viscosity coefficients were not found. Viscosity will be approximate.")
             G_123 = G_23 = 0
+            x_cat = 0
 
         # get the kinematic viscosity of water, returned by IAPWS in m2/s
         nu_w = self.water_substance.nu
@@ -651,14 +742,10 @@ class Solution(MSONable):
         # get the MW of water
         MW_w = self.get_property(self.solvent, "molecular_weight").magnitude
 
-        # calculate the cation mole fraction
-        # x_cat = self.get_amount(cation, "fraction")
-        x_cat = self.get_amount(salt.cation, "fraction").magnitude
-
         # calculate the kinematic viscosity
         nu = np.log(nu_w * MW_w / MW) + 15 * x_cat**2 + x_cat**3 * G_123 + 3 * x_cat * G_23 * (1 - 0.05 * x_cat)
 
-        return ureg.Quantity(np.exp(nu), "m**2 / s")
+        return np.exp(nu) * ureg.m**2 / ureg.s
 
     @property
     def conductivity(self) -> Quantity:
@@ -686,21 +773,22 @@ class Solution(MSONable):
 
         References:
             .. [aq] https://www.aqion.de/site/electrical-conductivity
-            .. [hc] http://www.hydrochemistry.eu/exmpls/sc.html
+            .. [hc] https://www.hydrochemistry.eu/exmpls/sc.html
 
         See Also:
             :py:attr:`ionic_strength`
             :py:meth:`get_diffusion_coefficient`
             :py:meth:`get_molar_conductivity`
         """
-        EC = ureg.Quantity(
+        EC = (
             np.asarray(
                 [
                     self.get_molar_conductivity(i).to("S*L/mol/m").magnitude * self.get_amount(i, "mol/L").magnitude
                     for i in self.components
                 ]
-            ),
-            "S/m",
+            )
+            * ureg.S
+            / ureg.m
         )
         return np.sum(EC)
 
@@ -730,12 +818,12 @@ class Solution(MSONable):
 
         Examples:
             >>> s1 = pyEQL.Solution([['Na+','0.2 mol/kg'],['Cl-','0.2 mol/kg']])
-            >>> s1.ionic_strength
-            <Quantity(0.20000010029672785, 'mole / kilogram')>
+            >>> s1.ionic_strength  # doctest: +ELLIPSIS
+            <Quantity(0.200000..., 'mole / kilogram')>
 
             >>> s1 = pyEQL.Solution([['Mg+2','0.3 mol/kg'],['Na+','0.1 mol/kg'],['Cl-','0.7 mol/kg']],temperature='30 degC')
-            >>> s1.ionic_strength
-            <Quantity(1.0000001004383303, 'mole / kilogram')>
+            >>> s1.ionic_strength  # doctest: +ELLIPSIS
+            <Quantity(1.000000..., 'mole / kilogram')>
         """
         # compute using magnitudes only, for performance reasons
         ionic_strength = np.sum(
@@ -743,16 +831,16 @@ class Solution(MSONable):
         )
         ionic_strength /= self.solvent_mass.to("kg").magnitude  # convert to mol/kg
         ionic_strength *= 0.5
-        return ureg.Quantity(ionic_strength, "mol/kg")
+        return ionic_strength * ureg.mol / ureg.kg
 
     @property
     def charge_balance(self) -> float:
         r"""
-        Return the charge balance of the solution.
+        Return the signed charge balance of the solution, positive or negative.
 
-        Return the charge balance of the solution. The charge balance represents the net electric charge
-        on the solution and SHOULD equal zero at all times, but due to numerical errors will usually
-        have a small nonzero value. It is calculated according to:
+        Return the signed charge balance of the solution, positive or negative. The charge balance represents the net electric charge
+        of the solution and SHOULD equal zero at all times, but due to numerical errors will usually have a small nonzero value.
+        Positive values indicate excess cationic charge, while negative values indivate excess anionic charge. It is calculated according to:
 
         .. math:: CB = \sum_i C_i z_i
 
@@ -760,7 +848,7 @@ class Solution(MSONable):
 
         Returns:
             float :
-                The charge balance of the solution, in equivalents (mol of charge) per L.
+                The signed charge balance of the solution, in equivalents (mol of charge) per L.
 
         """
         charge_balance = 0
@@ -785,14 +873,25 @@ class Solution(MSONable):
 
             Where :math:`C_{B}` and :math:`C_{A}` are conservative cations and anions, respectively
             (i.e. ions that do not participate in acid-base reactions), and :math:`z_{i}` is their signed charge.
-            In this method, the set of conservative cations is all Group I and Group II cations, and the
-            conservative anions are all the anions of strong acids.
+            When conservative cations (Group I and II cations) or strong base anions are present, the alkalinity is calculated according to[stm]_
+
+            .. math::   Alk = \sum_{i} z_{i} C_{B} + \sum_{i} z_{i} C_{A}
+
+            Where :math:`C_{B}` and :math:`C_{A}` are conservative cations and strong base anions, respectively  (i.e. ions that do not participate in acid-base reactions), and :math:`z_{i}` is their signed charge.
+
+            Alternatively, if those species are not present, then alkalinity is calculated based on the concentrations of weak acid and base species according to [stm]_
+
+            .. math:: Alk = -\sum_{i} z_{i} C_{i}
+
+            Where :math:`C_i` is the molar concentration of species i, and :math:`z_i` is its charge.
+
+            The summation should extend over all weak inorganic species that can participate in acid-base reactions. In this method, we consider HCO3[-1], CO3[-2], H2PO4[-1], HPO4[-2], PO4[-3], HS[-1], S[-2], H3SiO4[-1], H2SiO4[-2], B(OH)4[-1], NH3(aq), OH[-1], and H[+1] as the relevant weak acid/base species, while organics are excluded.
 
         References:
             .. [stm] Stumm, Werner and Morgan, James J. Aquatic Chemistry, 3rd ed, pp 165. Wiley Interscience, 1996.
 
         """
-        alkalinity = ureg.Quantity(0, "mol/L")
+        alkalinity = 0 * ureg.mol / ureg.L
 
         base_cations = {
             "Li[+1]",
@@ -808,14 +907,44 @@ class Solution(MSONable):
             "Ba[+2]",
             "Ra[+2]",
         }
-        acid_anions = {"Cl[-1]", "Br[-1]", "I[-1]", "SO4[-2]", "NO3[-1]", "ClO4[-1]", "ClO3[-1]"}
+        acid_anions = {
+            "Cl[-1]",
+            "Br[-1]",
+            "I[-1]",
+            "SO4[-2]",
+            "NO3[-1]",
+            "ClO4[-1]",
+            "ClO3[-1]",
+        }
+
+        weak_species = {
+            "HCO3[-1]",
+            "CO3[-2]",
+            "H2PO4[-1]",
+            "HPO4[-2]",
+            "PO4[-3]",
+            "HS[-1]",
+            "S[-2]",
+            "H3SiO4[-1]",
+            "H2SiO4[-2]",
+            "B(OH)4[-1]",
+            "NH3(aq)",
+            "OH[-1]",
+            "H[+1]",
+        }  # Note that organics are excluded
+
+        conservative_species = base_cations.union(acid_anions)
+        # check presence of conservative cations or strong base anions
+        conservative_def = any(item in conservative_species for item in self.components)
 
         for item in self.components:
-            if item in base_cations.union(acid_anions):
-                z = self.get_property(item, "charge")
-                alkalinity += self.get_amount(item, "mol/L") * z
+            if item in conservative_species:
+                # Conservative cations and strong base anions
+                alkalinity += self.get_amount(item, "eq/L")
+            elif item in weak_species and not conservative_def:
+                # Weak acid/base species, exclude organics
+                alkalinity += self.get_amount(item, "eq/L") * (-1)
 
-        # convert the alkalinity to mg/L as CaCO3
         return (alkalinity * EQUIV_WT_CACO3).to("mg/L")
 
     @property
@@ -834,7 +963,7 @@ class Solution(MSONable):
                 The hardness of the solution in mg/L as CaCO3
 
         """
-        hardness = ureg.Quantity(0, "mol/L")
+        hardness = 0 * ureg.mol / ureg.L
 
         for item in self.components:
             z = self.get_property(item, "charge")
@@ -852,7 +981,7 @@ class Solution(MSONable):
         The TDS is defined as the sum of the concentrations of all aqueous solutes (not including the solvent),
         except for H[+1] and OH[-1]].
         """
-        tds = ureg.Quantity(0, "mg/L")
+        tds = 0 * ureg.mg / ureg.L
         for s in self.components:
             # ignore pure water and dissolved gases, but not CO2
             if s in ["H2O(aq)", "H[+1]", "OH[-1]"]:
@@ -885,7 +1014,7 @@ class Solution(MSONable):
         Returns The Debye length, in nanometers.
 
         References:
-            .. [wk3] https://en.wikipedia.org/wiki/Debye_length#Debye_length_in_an_electrolyte
+            .. [wk3] https://en.wikipedia.org/wiki/Debye_length#In_an_electrolyte_solution
 
         See Also:
             :attr:`ionic_strength`
@@ -893,7 +1022,7 @@ class Solution(MSONable):
 
         """
         # to preserve dimensionality, convert the ionic strength into mol/L units
-        ionic_strength = ureg.Quantity(self.ionic_strength.magnitude, "mol/L")
+        ionic_strength = self.ionic_strength.magnitude * ureg.mol / ureg.L
         dielectric_constant = self.dielectric_constant
 
         debye_length = (
@@ -932,8 +1061,8 @@ class Solution(MSONable):
 
         Examples:
             >>> s1 = pyEQL.Solution()
-            >>> s1.bjerrum_length
-            <Quantity(0.7152793009386953, 'nanometer')>
+            >>> s1.bjerrum_length  # doctest: +ELLIPSIS
+            <Quantity(0.714..., 'nanometer')>
 
         See Also:
             :attr:`dielectric_constant`
@@ -968,16 +1097,16 @@ class Solution(MSONable):
             .. [sata] Sata, Toshikatsu. Ion Exchange Membranes: Preparation, Characterization, and Modification.
                 Royal Society of Chemistry, 2004, p. 10.
 
-            .. [wk] http://en.wikipedia.org/wiki/Osmotic_pressure#Derivation_of_osmotic_pressure
+            .. [wk] https://en.wikipedia.org/wiki/Osmotic_pressure#Derivation_of_the_van_'t_Hoff_formula
 
         Examples:
-            >>> s1=pyEQL.Solution()
-            >>> s1.osmotic_pressure
-            <Quantity(0.495791416, 'pascal')>
+            >>> s1 = pyEQL.Solution()
+            >>> s1.osmotic_pressure  # doctest: +ELLIPSIS
+            <Quantity(0.494327..., 'pascal')>
 
             >>> s1 = pyEQL.Solution([['Na+','0.2 mol/kg'],['Cl-','0.2 mol/kg']])
-            >>> soln.osmotic_pressure
-            <Quantity(906516.7318131207, 'pascal')>
+            >>> s1.osmotic_pressure  # doctest: +ELLIPSIS
+            <Quantity(9132..., 'pascal')>
         """
         partial_molar_volume_water = self.get_property(self.solvent, "size.molar_volume")
 
@@ -1026,7 +1155,7 @@ class Solution(MSONable):
             :meth:`get_osmolarity`
             :meth:`get_osmolality`
             :meth:`get_total_moles_solute`
-            :func:`pyEQL.utils.interpret_units`
+            :func:`pyEQL.utils.translate_units`
         """
         z = 1
         # sanitized unit to be passed to pint
@@ -1036,11 +1165,11 @@ class Solution(MSONable):
             if z == 0:  # uncharged solutes have zero equiv concentration
                 return ureg.Quantity(0, _units)
         else:
-            _units = interpret_units(units)
+            _units = translate_units(units)
 
         # retrieve the number of moles of solute and its molecular weight
         try:
-            moles = ureg.Quantity(self.components[solute], "mol")
+            moles = self.components[solute] * ureg.mol
         # if the solute is not present in the solution, we'll get a KeyError
         # In that case, the amount is zero
         except KeyError:
@@ -1050,7 +1179,7 @@ class Solution(MSONable):
                 self.logger.error(
                     f"Unsupported unit {units} specified for zero-concentration solute {solute}. Returned 0."
                 )
-                return ureg.Quantity(0, "dimensionless")
+                return ureg.Quantity(0)
 
         # with pint unit conversions enabled, we just pass the unit to pint
         # the logic tests here ensure that only the required arguments are
@@ -1079,13 +1208,31 @@ class Solution(MSONable):
 
         raise ValueError(f"Unsupported unit {units} specified for get_amount")
 
-    def get_components_by_element(self) -> dict[str, list]:
+    def get_components_by_element(
+        self, nested: bool = False
+    ) -> dict[str, list[str]] | dict[str, dict[float | str, list[str]]]:
         """
         Return a list of all species associated with a given element.
 
-        Elements (keys) are suffixed with their oxidation state in parentheses, e.g.,
+        Args:
+            nested : bool
+                Whether to return a nested dictionary of <element>
+                to <valence> => <list of species> mapping. False by default.
 
-        {"Na(1.0)":["Na[+1]", "NaOH(aq)"]}
+        Returns:
+            A mapping of element to a list of species in the solution.
+
+            If nested is False (default), elements (keys) are suffixed with
+            their oxidation state in parentheses, e.g.,
+
+            {"Na(1.0)":["Na[+1]", "NaOH(aq)"]}
+
+            If nested is True, the dictionary is nested, e.g.,
+
+            {"Na": [{1:["Na[+1]", "NaOH(aq)"]}]}.
+
+            Note that the valence may be a string, assuming the value "unk"
+            denoting an unknown oxidation state.
 
         Species associated with each element are sorted in descending order of the amount
         present (i.e., the first species listed is the most abundant).
@@ -1104,20 +1251,41 @@ class Solution(MSONable):
                 except (TypeError, IndexError):
                     self.logger.error(f"No oxidation state found for element {el}. Assigning '{UNKNOWN_OXI_STATE}'")
                     oxi_state = UNKNOWN_OXI_STATE
-                key = f"{el}({oxi_state})"
-                if d.get(key):
-                    d[key].append(s)
+                if d.get(el):
+                    if d[el].get(oxi_state):
+                        d[el][oxi_state].append(s)
+                    else:
+                        d[el][oxi_state] = [s]
                 else:
-                    d[key] = [s]
+                    d[el] = {oxi_state: [s]}
 
-        return d
+        if nested:
+            return d
+        return {f"{el}({val})": species for el, val_dict in d.items() for val, species in val_dict.items()}
 
-    def get_el_amt_dict(self):
+    def get_el_amt_dict(self, nested: bool = False) -> dict[str, float] | dict[str, dict[float | str, float]]:
         """
         Return a dict of Element: amount in mol.
 
-        Elements (keys) are suffixed with their oxidation state in parentheses,
-        e.g. "Fe(2.0)", "Cl(-1.0)".
+        Args:
+            nested : bool
+                Whether to return a nested dictionary of <element>
+                to <valence> => amount mapping. False by default.
+
+        Returns:
+            A mapping of element to its amount in moles in the solution.
+
+            If nested is False (default), elements (keys) are suffixed with
+            their oxidation state in parentheses, e.g.,
+
+            {"Fe(2.0)": 0.354, "Cl(-1.0)": 0.708}
+
+            If nested is True, the dictionary is nested, e.g.,
+
+            {"Fe": {2.0: 0.354}, "Cl": {-1.0: 0.708}}.}
+
+            Note that the valence may be a string, assuming the value "unk"
+            denoting an unknown oxidation state.
         """
         d = {}
         for s, mol in self.components.items():
@@ -1134,13 +1302,17 @@ class Solution(MSONable):
                 except (TypeError, IndexError):
                     self.logger.error(f"No oxidation state found for element {el}. Assigning '{UNKNOWN_OXI_STATE}'")
                     oxi_state = UNKNOWN_OXI_STATE
-                key = f"{el}({oxi_state})"
-                if d.get(key):
-                    d[key] += stoich * mol
+                if d.get(el):
+                    if d[el].get(oxi_state):
+                        d[el][oxi_state] += stoich * mol
+                    else:
+                        d[el][oxi_state] = stoich * mol
                 else:
-                    d[key] = stoich * mol
+                    d[el] = {oxi_state: stoich * mol}
 
-        return d
+        if nested:
+            return d
+        return {f"{el}({val})": amount for el, val_dict in d.items() for val, amount in val_dict.items()}
 
     def get_total_amount(self, element: str, units: str) -> Quantity:
         """
@@ -1159,14 +1331,14 @@ class Solution(MSONable):
 
         See Also:
             :meth:`get_amount`
-            :func:`pyEQL.utils.interpret_units`
+            :func:`pyEQL.utils.translate_units`
         """
-        _units = interpret_units(units)
+        _units = translate_units(units)
         TOT: Quantity = ureg.Quantity(0, _units)
 
         # standardize the element formula and units
         el = str(Element(element.split("(")[0]))
-        units = interpret_units(units)
+        units = translate_units(units)
 
         # enumerate the species whose concentrations we need
         comp_by_element = self.get_components_by_element()
@@ -1175,7 +1347,7 @@ class Solution(MSONable):
         if "(" in element and UNKNOWN_OXI_STATE not in element:
             ox = float(element.split("(")[-1].split(")")[0])
             key = f"{el}({ox})"
-            species = comp_by_element.get(key)
+            species = comp_by_element.get(key, [])
         else:
             species = []
             for k, v in comp_by_element.items():
@@ -1210,15 +1382,16 @@ class Solution(MSONable):
         """Primary method for adding substances to a pyEQL solution.
 
         Args:
-            formula (str): Chemical formula for the solute. Charged species must contain a + or - and
-            (for polyvalent solutes) a number representing the net charge (e.g. 'SO4-2').
-            amount (str): The amount of substance in the specified unit system. The string should contain
-            both a quantity and a pint-compatible representation of a ureg. e.g. '5 mol/kg' or '0.1 g/L'.
+            formula (str): Chemical formula for the solute. Charged species must contain a+ or - and
+               (for polyvalent solutes) a number representing the net charge (e.g. 'SO4-2').
+            amount (str): The amount of substance in the specified unit system. The string should
+               contain both a quantity and a pint-compatible representation of a ureg. e.g. '5 mol/kg' or '0.1 g/L'.
         """
+        Q = ureg.Quantity(*_translate_pint_quantity(amount))
         # if units are given on a per-volume basis,
         # iteratively solve for the amount of solute that will preserve the
         # original volume and result in the desired concentration
-        if ureg.Quantity(amount).dimensionality in (
+        if Q.dimensionality in (
             "[substance]/[length]**3",
             "[mass]/[length]**3",
         ):
@@ -1226,9 +1399,8 @@ class Solution(MSONable):
             orig_volume = self.volume
 
             # add the new solute
-            quantity = ureg.Quantity(amount)
             mw = self.get_property(formula, "molecular_weight")  # returns a quantity
-            target_mol = quantity.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
+            target_mol = Q.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
             self.components[formula] = target_mol.to("moles").magnitude
 
             # calculate the volume occupied by all the solutes
@@ -1239,37 +1411,29 @@ class Solution(MSONable):
 
             # adjust the amount of solvent
             # density is returned in kg/m3 = g/L
-            target_mass = target_vol * ureg.Quantity(self.water_substance.rho, "g/L")
-            # mw = ureg.Quantity(self.get_property(self.solvent_name, "molecular_weight"))
+            target_mass = target_vol * self.water_substance.rho * ureg.g / ureg.L
             mw = self.get_property(self.solvent, "molecular_weight")
             if mw is None:
                 raise ValueError(f"Molecular weight for solvent {self.solvent} not found in database. Cannot proceed.")
             target_mol = target_mass.to("g") / mw.to("g/mol")
             self.components[self.solvent] = target_mol.magnitude
-
         else:
-            # add the new solute
-            quantity = ureg.Quantity(amount)
-            mw = ureg.Quantity(self.get_property(formula, "molecular_weight"))
-            target_mol = quantity.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
-            self.components[formula] = target_mol.to("moles").magnitude
+            if Q.dimensionality == "[substance]":
+                # add the new solute directly
+                self.components[formula] = Q.to("moles").magnitude
+            else:
+                # add the new solute after converting to moles
+                mw = self.get_property(formula, "molecular_weight")  # returns a quantity
+                target_mol = Q.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
+                self.components[formula] = target_mol.to("moles").magnitude
 
             # update the volume to account for the space occupied by all the solutes
             # make sure that there is still solvent present in the first place
-            if self.solvent_mass <= ureg.Quantity(0, "kg"):
+            if self.solvent_mass.magnitude <= 0:
                 self.logger.error("All solvent has been depleted from the solution")
                 return
             # set the volume recalculation flag
             self.volume_update_required = True
-
-    # TODO - deprecate this method. Solvent should be added to the dict like anything else
-    # and solvent_name will track which component it is.
-    def add_solvent(self, formula: str, amount: str):
-        """Same as add_solute but omits the need to pass solvent mass to pint."""
-        quantity = ureg.Quantity(amount)
-        mw = self.get_property(formula, "molecular_weight")
-        target_mol = quantity.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
-        self.components[formula] = target_mol.to("moles").magnitude
 
     def add_amount(self, solute: str, amount: str):
         """
@@ -1289,11 +1453,12 @@ class Solution(MSONable):
         Returns:
             Nothing. The concentration of solute is modified.
         """
+        Q = ureg.Quantity(*_translate_pint_quantity(amount))
         # Get the current amount of the solute
         current_amt = self.get_amount(solute, amount.split(" ")[1])
         if current_amt.magnitude == 0:
             self.logger.warning(f"Add new solute {solute} to the solution")
-        new_amt = ureg.Quantity(amount) + current_amt
+        new_amt = Q + current_amt
         self.set_amount(solute, new_amt)
 
     def set_amount(self, solute: str, amount: str):
@@ -1320,14 +1485,15 @@ class Solution(MSONable):
             Nothing. The concentration of solute is modified.
 
         """
+        Q = ureg.Quantity(*_translate_pint_quantity(amount))
         # raise an error if a negative amount is specified
-        if ureg.Quantity(amount).magnitude < 0:
+        if Q.magnitude < 0:
             raise ValueError(f"Negative amount specified for solute {solute}. Concentration not changed.")
 
         # if units are given on a per-volume basis,
         # iteratively solve for the amount of solute that will preserve the
         # original volume and result in the desired concentration
-        if ureg.Quantity(amount).dimensionality in (
+        if Q.dimensionality in (
             "[substance]/[length]**3",
             "[mass]/[length]**3",
         ):
@@ -1335,17 +1501,13 @@ class Solution(MSONable):
             orig_volume = self.volume
 
             # change the amount of the solute present to match the desired amount
-            self.components[solute] = (
-                ureg.Quantity(amount)
-                .to(
-                    "moles",
-                    "chem",
-                    mw=ureg.Quantity(self.get_property(solute, "molecular_weight")),
-                    volume=self.volume,
-                    solvent_mass=self.solvent_mass,
-                )
-                .magnitude
-            )
+            self.components[solute] = Q.to(
+                "moles",
+                "chem",
+                mw=ureg.Quantity(self.get_property(solute, "molecular_weight")),
+                volume=self.volume,
+                solvent_mass=self.solvent_mass,
+            ).magnitude
 
             # calculate the volume occupied by all the solutes
             solute_vol = self._get_solute_volume()
@@ -1354,32 +1516,28 @@ class Solution(MSONable):
             target_vol = orig_volume - solute_vol
 
             # adjust the amount of solvent
-            target_mass = target_vol * ureg.Quantity(self.water_substance.rho, "g/L")
+            target_mass = target_vol * self.water_substance.rho * ureg.g / ureg.L
             mw = self.get_property(self.solvent, "molecular_weight")
             target_mol = target_mass / mw
             self.components[self.solvent] = target_mol.to("mol").magnitude
 
         else:
             # change the amount of the solute present
-            self.components[solute] = (
-                ureg.Quantity(amount)
-                .to(
-                    "moles",
-                    "chem",
-                    mw=ureg.Quantity(self.get_property(solute, "molecular_weight")),
-                    volume=self.volume,
-                    solvent_mass=self.solvent_mass,
-                )
-                .magnitude
-            )
+            self.components[solute] = Q.to(
+                "moles",
+                "chem",
+                mw=ureg.Quantity(self.get_property(solute, "molecular_weight")),
+                volume=self.volume,
+                solvent_mass=self.solvent_mass,
+            ).magnitude
 
-            # update the volume to account for the space occupied by all the solutes
             # make sure that there is still solvent present in the first place
-            if self.solvent_mass <= ureg.Quantity(0, "kg"):
+            if self.solvent_mass.magnitude <= 0:
                 self.logger.critical("All solvent has been depleted from the solution")
                 return
 
-            self._update_volume()
+            # update the volume to account for the space occupied by all the solutes
+            self.volume_update_required = True
 
     def get_total_moles_solute(self) -> Quantity:
         """Return the total moles of all solute in the solution."""
@@ -1387,7 +1545,7 @@ class Solution(MSONable):
         for item in self.components:
             if item != self.solvent:
                 tot_mol += self.components[item]
-        return ureg.Quantity(tot_mol, "mol")
+        return tot_mol * ureg.mol
 
     def get_moles_solvent(self) -> Quantity:
         """
@@ -1456,14 +1614,14 @@ class Solution(MSONable):
 
         Examples:
             >>> s1 = Solution([['Na+','0.5 mol/kg'],['Cl-','0.5 mol/kg']])
-            >>> s1.get_salt()
-            <pyEQL.salt_ion_match.Salt object at 0x7fe6d3542048>
+            >>> s1.get_salt()  # doctest: +ELLIPSIS
+            <pyEQL.salt_ion_match.Salt object at 0x...>
             >>> s1.get_salt().formula
             'NaCl'
             >>> s1.get_salt().nu_cation
             1
             >>> s1.get_salt().z_anion
-            -1
+            -1.0
 
             >>> s2 = pyEQL.Solution([['Na+','0.1 mol/kg'],['Mg+2','0.2 mol/kg'],['Cl-','0.5 mol/kg']])
             >>> s2.get_salt().formula
@@ -1471,74 +1629,92 @@ class Solution(MSONable):
             >>> s2.get_salt().nu_anion
             2
             >>> s2.get_salt().z_cation
-            2
+            2.0
         """
-        d = self.get_salt_dict()
-        first_key = next(iter(d.keys()))
-        return Salt(d[first_key]["cation"], d[first_key]["anion"])
+        try:
+            salt: Salt = next(d["salt"] for d in self.get_salt_dict().values())
+            return salt
+        except StopIteration:
+            return None
 
     # TODO - modify? deprecate? make a salts property?
-    def get_salt_dict(self, cutoff: float = 0.01, use_totals: bool = True) -> dict[str, dict]:
+    def get_salt_dict(self, cutoff: float = 1e-6, use_totals: bool = True) -> dict[str, dict[str, float | Salt]]:
         """
-        Returns a dict of salts that approximates the composition of the Solution. Like `components`, the dict is
-        keyed by formula and the values are the total moles present in the solution, e.g., {"NaCl(aq)": 1}. If the
-        Solution is pure water, the returned dict contains only 'HOH'.
+        Returns a dict that represents the salts of the Solution by pairing anions and cations.
+
+        The ``get_salt_dict()`` method examines the ionic composition of a solution and approximates it as a set of
+        salts instead of individual ions. The method returns a dictionary of Salt objects where the keys are the salt
+        formulas (e.g., 'NaCl'). The Salt object contains information about the stoichiometry of the salt to
+        enable its effective concentration to be calculated (e.g., 1 M MgCl2 yields 1 M Mg+2 and 2 M Cl-).
 
         Args:
-            cutoff: Lowest salt concentration to consider. Analysis will stop once the concentrations of Salts being
-                analyzed goes below this value. Useful for excluding analysis of trace anions.
-            use_totals: Whether to base the analysis on total element concentrations or individual species
-                concentrations.
-
-        Notes:
-            Salts are identified by pairing the predominant cations and anions in the solution, in descending order
-            of their respective equivalent amounts.
-
-        Many empirical equations for solution properties such as activity coefficient,
-        partial molar volume, or viscosity are based on the concentration of
-        single salts (e.g., NaCl). When multiple ions are present (e.g., a solution
-        containing Na+, Cl-, and Mg+2), it is generally not possible to directly model
-        these quantities.
-
-        The get_salt_dict() method examines the ionic composition of a solution and
-        simplifies it into a list of salts. The method returns a dictionary of
-        Salt objects where the keys are the salt formulas (e.g., 'NaCl'). The
-        Salt object contains information about the stoichiometry of the salt to
-        enable its effective concentration to be calculated
-        (e.g., 1 M MgCl2 yields 1 M Mg+2 and 2 M Cl-).
+            cutoff: Lowest molal concentration to consider. No salts below this value will be included in the output.
+                Useful for excluding analysis of trace anions. Defaults to 1e-6 (1 part per million).
+            use_totals: Whether or not to base the analysis on the concentration of the predominant species of each
+                element. Note that species in which a given element assumes a different oxidation state are always
+                treated separately.
 
         Returns:
             dict
-                A dictionary of Salt objects, keyed to the salt formula
-
-        See Also:
-            :py:attr:`osmotic_pressure`
-            :py:attr:`viscosity_kinematic`
-            :py:meth:`get_activity`
-            :py:meth:`get_activity_coefficient`
-            :py:meth:`get_water_activity`
-            :py:meth:`get_osmotic_coefficient`
-        """
-        """
-        Returns a dict of salts that approximates the composition of the Solution. Like `components`, the dict is
-        keyed by formula and the values are the total moles of salt present in the solution, e.g., {"NaCl(aq)": 1}
+                A dictionary of representing salts in the solution, keyed by the salt formula.
 
         Notes:
-            Salts are identified by pairing the predominant cations and anions in the solution, in descending order
-            of their respective equivalent amounts.
+            The dict maps salt formulas to dictionaries containing their amounts and composition. The amount is stored
+            in moles under the key "mol", and a :class:`pyEQL.salt_ion_match.Salt` object stored under the "salt" key
+            represents the composition. Salts are identified by pairing the predominant cations and anions in the
+            solution, in descending order of their respective equivalent amounts.
+
+            Many empirical equations for solution properties such as activity coefficient, partial molar volume, or
+            viscosity are based on the concentration of single salts (e.g., NaCl). When multiple ions are present
+            (e.g., a solution containing Na+, Cl-, and Mg+2), it is generally not possible to directly model
+            these quantities.
+
+        Examples:
+            >>> from pyEQL import Solution
+            >>> from pyEQL.salt_ion_match import Salt
+            >>> s1 = Solution(
+            ...     solutes={
+            ...         'Na[+1]': '1 mol/L',
+            ...         'Cl[-1]': '1 mol/L',
+            ...         'Ca[+2]': '0.01 mol/kg',
+            ...         'HCO3[-1]': '0.007 mol/kg',
+            ...         'CO3[-2]': '0.001 mol/kg',
+            ...         'ClO[-1]': '0.001 mol/kg',
+            ...     }
+            ... )
+            >>> salt_dict = s1.get_salt_dict()
+            >>> list(salt_dict)  # Returns salts above the default cutoff (1e-6 mol/kg)
+            ['NaCl', 'Ca(HCO3)2', 'Ca(ClO)2']
+            >>> salt_dict['NaCl']['salt']
+            <pyEQL.salt_ion_match.Salt object at ...>
+            >>> salt_dict['NaCl']['mol']
+            1.0
+            >>> salt_dict = s1.get_salt_dict(cutoff=1e-3)
+            >>> list(salt_dict)  # Higher cutoff excludes the minor ClO- species
+            ['NaCl', 'Ca(HCO3)2']
+            >>> salt_dict = s1.get_salt_dict(cutoff=1e-4, use_totals=False)
+            >>> list(salt_dict)  # Returns salts with minor (same oxidation state) species since use_totals=False
+            ['NaCl', 'Ca(HCO3)2', 'CaCO3', 'Ca(ClO)2']
 
         See Also:
             :attr:`components`
             :attr:`cations`
             :attr:`anions`
+            :class:`pyEQL.salt_ion_match.Salt`
+            :py:meth:`get_activity_coefficient`
+            :py:meth:`get_water_activity`
+            :py:meth:`get_osmotic_coefficient`
         """
-        salt_dict: dict[str, float] = {}
+        salt_dict: dict[str, dict[str, float | Salt]] = {}
 
         if use_totals:
-            # # use only the predominant species for each element
+            # use only the predominant species for each element
             components = {}
-            for el, lst in self.get_components_by_element().items():
-                components[lst[0]] = self.get_total_amount(el, "mol").magnitude
+            for el, lst in self.get_components_by_element(nested=False).items():
+                component = lst[0]
+                el_no_oxi_state = el.split("(")[0]
+                nu_el = self.get_property(component, "pmg_ion").get(el_no_oxi_state, 0)
+                components[component] = self.get_total_amount(el, "mol").magnitude / nu_el
             # add H+ and OH-, which would otherwise be excluded
             for k in ["H[+1]", "OH[-1]"]:
                 if self.components.get(k):
@@ -1558,7 +1734,7 @@ class Solution(MSONable):
         # calculate the charge-weighted (equivalent) concentration of each ion
         cation_equiv = {k: self.get_property(k, "charge") * components[k] for k in cations}
         anion_equiv = {
-            k: -1 * self.get_property(k, "charge") * components[k] for k in anions
+            k: self.get_property(k, "charge") * components[k] * -1 for k in anions
         }  # make sure amounts are positive
 
         # sort in descending order of equivalent concentration
@@ -1568,89 +1744,86 @@ class Solution(MSONable):
         len_cat = len(cation_equiv)
         len_an = len(anion_equiv)
 
-        # Only ions are H+ and OH-; return a Salt represnting water (with no amount)
-        if len_cat <= 1 and len_an <= 1 and self.solvent == "H2O(aq)":
-            x = Salt("H[+1]", "OH[-1]")
-            salt_dict.update({x.formula: x.as_dict()})
-            salt_dict[x.formula]["mol"] = self.get_amount("H2O", "mol")
-            return salt_dict
-
         # start with the first cation and anion
         index_cat = 0
         index_an = 0
 
-        # list(dict) returns a list of [(key, value), ]
-        cation_list = list(cation_equiv.items())
-        anion_list = list(anion_equiv.items())
-
-        # calculate the equivalent concentrations of each ion
-        c1 = cation_list[index_cat][-1]
-        a1 = anion_list[index_an][-1]
+        # list(dict) returns a list of [[key, value],]
+        cation_list = [[k, v] for k, v in cation_equiv.items()]
+        anion_list = [[k, v] for k, v in anion_equiv.items()]
+        solvent_mass = self.solvent_mass.to("kg").m
+        # tolerance for detecting edge cases where equilibrate() slightly changes the
+        # total amount of a solute
+        _atol = 1e-16
 
         while index_cat < len_cat and index_an < len_an:
-            # if the cation concentration is greater, there will be leftover cations
-            if c1 > a1:
-                # create the salt
-                x = Salt(cation_list[index_cat][0], anion_list[index_an][0])
-                # there will be leftover cation, so use the anion amount
-                salt_dict.update({x.formula: x.as_dict()})
-                salt_dict[x.formula]["mol"] = a1 / abs(x.z_anion * x.nu_anion)
-                # adjust the amounts of the respective ions
-                c1 = c1 - a1
-                # move to the next anion
-                index_an += 1
-                try:
-                    a1 = anion_list[index_an][-1]
-                    if a1 < cutoff:
-                        continue
-                except IndexError:
-                    continue
-            # if the anion concentration is greater, there will be leftover anions
-            if c1 < a1:
-                # create the salt
-                x = Salt(cation_list[index_cat][0], anion_list[index_an][0])
-                # there will be leftover anion, so use the cation amount
-                salt_dict.update({x.formula: x.as_dict()})
-                salt_dict[x.formula]["mol"] = c1 / x.z_cation * x.nu_cation
-                # calculate the leftover cation amount
-                a1 = a1 - c1
-                # move to the next cation
-                index_cat += 1
-                try:
-                    a1 = cation_list[index_cat][-1]
-                    if a1 < cutoff:
-                        continue
-                except IndexError:
-                    continue
-            if np.isclose(c1, a1):
-                # create the salt
-                x = Salt(cation_list[index_cat][0], anion_list[index_an][0])
-                # there will be nothing leftover, so it doesn't matter which ion you use
-                salt_dict.update({x.formula: x.as_dict()})
-                salt_dict[x.formula]["mol"] = c1 / x.z_cation * x.nu_cation
-                # move to the next cation and anion
-                index_an += 1
-                index_cat += 1
-                try:
-                    c1 = cation_list[index_cat][-1]
-                    a1 = anion_list[index_an][-1]
-                    if (c1 < cutoff) or (a1 < cutoff):
-                        continue
-                except IndexError:
-                    continue
+            c1 = cation_list[index_cat][-1]
+            a1 = anion_list[index_an][-1]
+            salt = Salt(cation_list[index_cat][0], anion_list[index_an][0])
 
-        return salt_dict
+            # Use the smaller of the two amounts
+            equivs_consumed = min(c1, a1)
+            cation_list[index_cat][-1] -= equivs_consumed
+            anion_list[index_an][-1] -= equivs_consumed
+            index_an += 1 if a1 == equivs_consumed else 0
+            index_cat += 1 if c1 == equivs_consumed else 0
+            mol = equivs_consumed / (salt.z_cation * salt.nu_cation)
 
-    def equilibrate(self, **kwargs) -> None:
+            # filter out water and zero, effectively zero, and sub-cutoff salt amounts
+            if salt.formula != "HOH" and (mol / solvent_mass + _atol) >= cutoff:
+                salt_dict[salt.formula] = {"salt": salt, "mol": mol}
+
+        return dict(sorted(salt_dict.items(), key=lambda x: x[1]["mol"], reverse=True))
+
+    def equilibrate(
+        self,
+        atmosphere: bool = False,
+        solids: list[str] | None = None,
+        gases: dict[str, str | float] | None = None,
+        **kwargs,
+    ) -> None:
         """
-        Update the composition of the Solution using the thermodynamic engine.
+        This method follows the equilibrate logic used in the NativeEOS engine, adapted as the default behavior for this class.
 
-        Any kwargs specified are passed through to self.engine.equilibrate()
+        Adjust the speciation of a Solution object to achieve chemical equilibrium.
 
-        Returns:
-            Nothing. The .components attribute of the Solution is updated.
+        Keyword Args:
+            atmosphere:
+                Boolean indicating whether to equilibrate the solution w.r.t
+                atmospheric gases. By default, this considers equilibrium with
+                atmospheric CO2 (420 ppm) and O2 (0.21 atm). N2 is
+                typically not considered due to its low solubility and limited
+                impact on aqueous speciation.
+            solids:
+                A list of solids used to achieve liquid-solid equilibrium. Each
+                solid in this list should be the name of a mineral phase present
+                in the Phreeqc database (e.g. "Calcite"). We assume a target
+                saturation index of 0 and an infinite amount of material.
+            gases:
+                A dictionary of gases used to achieve liquid-gas equilibrium.
+                Each key denotes the gas species, and the corresponding value
+                denotes its concentration, as a log partial pressure value or
+                other interpretable pressure units. For example, the following
+                are equivalent (log10(0.000316) = -3.5)
+                {"CO2": "0.000316 atm"}
+                {"CO2": -3.5}
+            **kwargs:
+                Additional engine-specific options passed to the underlying equilbrium
+                solver. These may include solver tolerances, or other advanced configuration
+                parameters introduced in v1.4.0.
         """
-        self.engine.equilibrate(self, **kwargs)
+        if self.engine == "native":
+            warnings.warn(
+                'In the next release, the default engine ("native") will '
+                "transition to a new version of the PHREEQC wrapper for "
+                "speciation calculations. No change in your script is "
+                "required, but if you call .equilibrate(), compare results "
+                "carefully between releases.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.engine.equilibrate(self, atmosphere=atmosphere, solids=solids, gases=gases, **kwargs)
 
     # Activity-related methods
     def get_activity_coefficient(
@@ -1667,23 +1840,22 @@ class Solution(MSONable):
         Args:
             solute: The solute for which to retrieve the activity coefficient
             scale:  The activity coefficient concentration scale
-            verbose: If True, pyEQL will print a message indicating the parent salt
-                     that is being used for activity calculations. This option is
-                     useful when modeling multicomponent solutions. False by default.
 
         Returns:
             Quantity: the activity coefficient as a dimensionless pint Quantity
         """
         # return unit activity coefficient if the concentration of the solute is zero
         if self.get_amount(solute, "mol").magnitude == 0:
-            return ureg.Quantity(1, "dimensionless")
+            # return ureg.Quantity(1, "dimensionless")
+            return ureg.Quantity(1)
 
         try:
             # get the molal-scale activity coefficient from the EOS engine
             molal = self.engine.get_activity_coefficient(solution=self, solute=solute)
         except (ValueError, ZeroDivisionError):
             self.logger.error("Calculation unsuccessful. Returning unit activity coefficient.", exc_info=True)
-            return ureg.Quantity(1, "dimensionless")
+            # return ureg.Quantity(1, "dimensionless")
+            return ureg.Quantity(1)
 
         # if necessary, convert the activity coefficient to another scale, and return the result
         if scale == "molal":
@@ -1691,11 +1863,11 @@ class Solution(MSONable):
         if scale == "molar":
             total_molality = self.get_total_moles_solute() / self.solvent_mass
             total_molarity = self.get_total_moles_solute() / self.volume
-            return (molal * ureg.Quantity(self.water_substance.rho, "g/L") * total_molality / total_molarity).to(
+            return (molal * self.water_substance.rho * ureg.g / ureg.L * total_molality / total_molarity).to(
                 "dimensionless"
             )
         if scale == "rational":
-            return molal * (1 + ureg.Quantity(0.018015, "kg/mol") * self.get_total_moles_solute() / self.solvent_mass)
+            return molal * 1 + 0.018015 * ureg.kg / ureg.mol * self.get_total_moles_solute() / self.solvent_mass
 
         raise ValueError("Invalid scale argument. Pass 'molal', 'molar', or 'rational'.")
 
@@ -1714,10 +1886,6 @@ class Solution(MSONable):
                 The concentration scale for the returned activity.
                 Valid options are "molal", "molar", and "rational" (i.e., mole fraction).
                 By default, the molal scale activity is returned.
-            verbose:
-                If True, pyEQL will print a message indicating the parent salt
-                that is being used for activity calculations. This option is
-                useful when modeling multicomponent solutions. False by default.
 
         Returns:
             The thermodynamic activity of the solute in question (dimensionless Quantity)
@@ -1754,7 +1922,7 @@ class Solution(MSONable):
             activity = (self.get_activity_coefficient(solute, scale=scale) * self.get_amount(solute, units)).magnitude
             self.logger.debug(f"Calculated {scale} scale activity of solute {solute} as {activity}")
 
-        return ureg.Quantity(activity, "dimensionless")
+        return ureg.Quantity(activity)
 
     # TODO - engine method
     def get_osmotic_coefficient(self, scale: Literal["molal", "molar", "rational"] = "molal") -> Quantity:
@@ -1771,17 +1939,18 @@ class Solution(MSONable):
         if scale == "rational":
             return (
                 -molal_phi
-                * ureg.Quantity(0.018015, "kg/mol")
+                * 0.018015
+                * ureg.kg
+                / ureg.mol
                 * self.get_total_moles_solute()
                 / self.solvent_mass
                 / np.log(self.get_amount(self.solvent, "fraction"))
             )
         if scale == "fugacity":
             return np.exp(
-                -molal_phi * ureg.Quantity(0.018015, "kg/mol") * self.get_total_moles_solute() / self.solvent_mass
+                -molal_phi * 0.018015 * ureg.kg / ureg.mol * self.get_total_moles_solute() / self.solvent_mass
                 - np.log(self.get_amount(self.solvent, "fraction"))
-            ) * ureg.Quantity(1, "dimensionless")
-
+            ) * ureg.Quantity(1)
         raise ValueError("Invalid scale argument. Pass 'molal', 'rational', or 'fugacity'.")
 
     def get_water_activity(self) -> Quantity:
@@ -1814,8 +1983,8 @@ class Solution(MSONable):
 
         Examples:
             >>> s1 = pyEQL.Solution([['Na+','0.3 mol/kg'],['Cl-','0.3 mol/kg']])
-            >>> s1.get_water_activity()
-            <Quantity(0.9900944932888518, 'dimensionless')>
+            >>> s1.get_water_activity()  # doctest: +ELLIPSIS
+            <Quantity(0.99009..., 'dimensionless')>
         """
         osmotic_coefficient = self.get_osmotic_coefficient()
 
@@ -1828,7 +1997,7 @@ class Solution(MSONable):
 
         self.logger.debug("Calculated water activity using osmotic coefficient")
 
-        return ureg.Quantity(np.exp(-osmotic_coefficient * 0.018015 * concentration_sum), "dimensionless")
+        return ureg.Quantity(np.exp(-osmotic_coefficient * 0.018015 * concentration_sum))
 
     def get_chemical_potential_energy(self, activity_correction: bool = True) -> Quantity:
         r"""
@@ -1864,11 +2033,10 @@ class Solution(MSONable):
             anion, and water).
 
         References:
-            .. [koga] Koga, Yoshikata, 2007. *Solution Thermodynamics and its Application to Aqueous Solutions:
-            A differential approach.* Elsevier, 2007, pp. 23-37.
-
+            .. [koga] Koga, Yoshikata, 2007. *Solution Thermodynamics and its Application to Aqueous Solutions:*
+               *A differential approach.* Elsevier, 2007, pp. 23-37.
         """
-        E = ureg.Quantity(0, "J")
+        E = 0 * ureg.J
 
         # loop through all the components and add their potential energy
         for item in self.components:
@@ -1909,31 +2077,35 @@ class Solution(MSONable):
             Quantity: The desired parameter or None if not found
 
         """
-        base_temperature = ureg.Quantity(25, "degC")
+        base_temperature = 25 * ureg.degC
         # base_pressure = ureg.Quantity("1 atm")
 
         # query the database using the standardized formula
         rform = standardize_formula(solute)
-        # TODO - there seems to be a bug in mongomock / JSONStore wherein properties does
-        # not properly return dot-notation fields, e.g. size.molar_volume will not be returned.
-        # also $exists:True does not properly return dot notated fields.
-        # for now, just set properties=[] to return everything
-        # data = list(self.database.query({"formula": rform, name: {"$ne": None}}, properties=["formula", name]))
-        data = list(self.database.query({"formula": rform, name: {"$ne": None}}))
+
+        # TODO - add molar volume of water to database?
+        if name == "size.molar_volume" and rform == "H2O(aq)":
+            # calculate the partial molar volume for water since it isn't in the database
+            vol = ureg.Quantity(self.get_property("H2O", "molecular_weight")) / (
+                self.water_substance.rho * ureg.g / ureg.L
+            )
+
+            return vol.to("cm **3 / mol")
+
+        # update the cached data if necessary (only if solute is not already present)
+        keys = [d["formula"] for d in self._solute_data]
+        if name not in CORE_PROPERTIES or rform not in keys:
+            self._solute_data.extend(list(self.database.query({"formula": rform, name: {"$exists": True}})))
+        data = [d for d in self._solute_data if d["formula"] == rform]
+
         # formulas should always be unique in the database. len==0 indicates no
         # data. len>1 indicates duplicate data.
-        if len(data) > 1:
+
+        if len(data) == 1:
+            pass
+        elif len(data) > 1:
             self.logger.warning(f"Duplicate database entries for solute {solute} found!")
-        if len(data) == 0:
-            # TODO - add molar volume of water to database?
-            if name == "size.molar_volume" and rform == "H2O(aq)":
-                # calculate the partial molar volume for water since it isn't in the database
-                vol = ureg.Quantity(self.get_property("H2O", "molecular_weight")) / (
-                    ureg.Quantity(self.water_substance.rho, "g/L")
-                )
-
-                return vol.to("cm **3 / mol")
-
+        elif len(data) == 0:
             # try to determine basic properties using pymatgen
             doc = Solute.from_formula(rform).as_dict()
             data = [doc]
@@ -1974,6 +2146,9 @@ class Solution(MSONable):
                 return None
 
             if name == "molecular_weight":
+                # if the unit is g/mol, we can speed up the Quantity instantiation by about 10x by using built in multiplication instead of parsing the string
+                if doc.get(name).split(" ")[-1] == "g/mol":
+                    return float(doc.get(name).split(" ")[0]) * ureg("g/mol")
                 return ureg.Quantity(doc.get(name))
 
             if name == "elements":
@@ -2020,38 +2195,46 @@ class Solution(MSONable):
             return ureg.Quantity(val)
         return None
 
+    def get_transference_number(self, solute: str) -> Quantity:
+        """Alias of get_transport_number(). Note that the transference number is only equal to the transport number if there are no concentration or pressure gradients."""
+        return self.get_transport_number(solute)
+
     def get_transport_number(self, solute: str) -> Quantity:
-        r"""Calculate the transport number of the solute in the solution.
+        r"""Calculate the transference number of a solute in the solution. Note that this is the
+        same as the _transport_ number if (and only if) there are no concentration or pressure gradients.
 
         Args:
-            solute: Formula of the solute for which the transport number is
-                to be calculated.
+            solute: Formula of the solute for which the transference number is to be calculated.
 
         Returns:
-                The transport number of `solute`, as a dimensionless Quantity.
+                The transference number of `solute`, as a dimensionless Quantity.
 
         Notes:
-            Transport number is calculated according to :
+            Transference number is calculated according to :
 
                 .. math::
 
                     t_i = {D_i z_i^2 C_i \over \sum D_i z_i^2 C_i}
 
-                Where :math:`C_i` is the concentration in mol/L, :math:`D_i` is the diffusion
-                coefficient, and :math:`z_i` is the charge, and the summation extends
-                over all species in the solution.
+            Where :math:`C_i` is the concentration in mol/L, :math:`D_i` is the diffusion
+            coefficient, and :math:`z_i` is the charge, and the summation extends
+            over all species in the solution.
 
-                Diffusion coefficients :math:`D_i` are adjusted for the effects of temperature
-                and ionic strength using the method implemented in PHREEQC >= 3.4.
-                See `get_diffusion_coefficient for` further details.
+            Diffusion coefficients :math:`D_i` are adjusted for the effects of temperature
+            and ionic strength using the method implemented in PHREEQC >= 3.4.
+            See `get_diffusion_coefficient for` further details.
 
 
         References:
-                Geise, G. M.; Cassady, H. J.; Paul, D. R.; Logan, E.; Hickner, M. A. "Specific
-                ion effects on membrane potential and the permselectivity of ion exchange membranes.""
-                *Phys. Chem. Chem. Phys.* 2014, 16, 21673-21681.
+            Bieusheuvel, P.M.; Dykstra, J.E.; *Introduction to Physical Processes in Environmental
+            Technology*, Section 6.2. https://www.physicsofelectrochemicalprocesses.com/book.pdf.
+
+            Geise, G. M.; Cassady, H. J.; Paul, D. R.; Logan, E.; Hickner, M. A. "Specific
+            ion effects on membrane potential and the permselectivity of ion exchange membranes.""
+            *Phys. Chem. Chem. Phys.* 2014, 16, 21673-21681.
 
         See Also:
+            :py:meth:`get_transference_number`
             :py:meth:`get_diffusion_coefficient`
             :py:meth:`get_molar_conductivity`
         """
@@ -2070,7 +2253,7 @@ class Solution(MSONable):
 
             denominator += term
 
-        return ureg.Quantity(numerator / denominator, "dimensionless")
+        return ureg.Quantity(numerator / denominator)
 
     def _get_molar_conductivity(self, solute: str) -> Quantity:
         r"""
@@ -2100,7 +2283,7 @@ class Solution(MSONable):
 
             2. https://www.hydrochemistry.eu/exmpls/sc.html
 
-            3. Appelo, C.A.J. Solute transport solved with the Nernst-Planck equation for concrete pores with `free'
+            3. Appelo, C.A.J. Solute transport solved with the Nernst-Planck equation for concrete pores with 'free'
                water and a double layer. Cement and Concrete Research 101, 2017.
                https://dx.doi.org/10.1016/j.cemconres.2017.08.030
 
@@ -2116,7 +2299,8 @@ class Solution(MSONable):
                 D * (ureg.e * ureg.N_A) ** 2 * self.get_property(solute, "charge") ** 2 / (ureg.R * self.temperature)
             )
         else:
-            molar_cond = ureg.Quantity(0, "mS / cm / (mol/L)")
+            # molar_cond = ureg.Quantity(0, "mS / cm / (mol/L)")
+            molar_cond = 0 * ureg.mS / ureg.cm / (ureg.mol / ureg.L)
 
         self.logger.debug(f"Calculated molar conductivity as {molar_cond} from D = {D!s} at T={self.temperature}")
 
@@ -2157,7 +2341,7 @@ class Solution(MSONable):
 
         References:
             1. https://www.hydrochemistry.eu/exmpls/sc.html
-            2. Appelo, C.A.J. Solute transport solved with the Nernst-Planck equation for concrete pores with `free'
+            2. Appelo, C.A.J. Solute transport solved with the Nernst-Planck equation for concrete pores with 'free'
                water and a double layer. Cement and Concrete Research 101, 2017.
                https://dx.doi.org/10.1016/j.cemconres.2017.08.030
             3. CRC Handbook of Chemistry and Physics
@@ -2174,7 +2358,7 @@ class Solution(MSONable):
                 f"Diffusion coefficient not found for species {rform}. Using default value of "
                 f"{self.default_diffusion_coeff} m**2/s."
             )
-            D = ureg.Quantity(self.default_diffusion_coeff, "m**2/s")
+            D = self.default_diffusion_coeff * ureg.m**2 / ureg.s
 
         # assume reference temperature is 298.15 K (this is the case for all current DB entries)
         T_ref = 298.15
@@ -2268,8 +2452,8 @@ class Solution(MSONable):
 
         Examples:
             >>> soln = Solution([['Na+','0.5 mol/kg'],['Cl-','0.5 mol/kg']])
-            >>> soln.get_lattice_distance('Na+')
-            1.492964.... nanometer
+            >>> soln.get_lattice_distance('Na+')  # doctest: +ELLIPSIS
+            <Quantity(1.497..., 'nanometer')>
 
         Notes:
             The lattice distance is related to the molar concentration as follows:
@@ -2283,6 +2467,55 @@ class Solution(MSONable):
         distance = (self.get_amount(solute, "mol/L") * ureg.N_A) ** (-1 / 3)
 
         return distance.to("nm")
+
+    def _solve_pH(self, target_pH: float, max_iter: int = 20, atol: float = 1e-8) -> None:
+        """Set [H+] and [OH-] so the solution's pH (activity scale) equals ``target_pH``.
+
+        This emulates PHREEQC. The input pH fixes the H+ *activity*
+        (:math:`a_{H^+} = 10^{-pH}`); the corresponding H+ *concentration* is then
+        back-calculated from the activity coefficient (:math:`m = a / \\gamma`). OH- is set
+        from the water self-ionization equilibrium expressed on the activity scale
+        (:math:`a_{H^+} \\, a_{OH^-} = K_W`), so that -- when :math:`\\gamma_{H^+}` and
+        :math:`\\gamma_{OH^-}` are equal, as in a neutral solution -- the H+ and OH-
+        concentrations remain equal and the solution stays electroneutral.
+
+        The activity coefficients depend on the overall composition (and, very weakly, on the
+        trace H+/OH- concentrations themselves), so the concentrations are found by fixed-point
+        iteration; this converges in a handful of steps because H+/OH- are usually trace.
+
+        Args:
+            target_pH: The desired (activity-scale) pH.
+            max_iter: Maximum number of fixed-point iterations.
+            atol: Absolute tolerance on pH used to decide convergence.
+        """
+        a_H = 10 ** (-target_pH)  # target H+ activity
+        a_OH = K_W / a_H  # OH- activity from the water equilibrium (activity product)
+        for _ in range(max_iter):
+            # For physically extreme pH (e.g. pH >> 14), the implied H+ or OH- concentration is so
+            # large that the activity-coefficient model can overflow. Guard against that and fall
+            # back to an ideal (unit) activity coefficient, which reduces to setting the
+            # concentration equal to the target activity.
+            with np.errstate(over="ignore", invalid="ignore"):
+                gamma_H = self.get_activity_coefficient("H+").magnitude
+                gamma_OH = self.get_activity_coefficient("OH-").magnitude
+            gamma_H = gamma_H if np.isfinite(gamma_H) and gamma_H > 0 else 1.0
+            gamma_OH = gamma_OH if np.isfinite(gamma_OH) and gamma_OH > 0 else 1.0
+            # target molality = activity / activity coefficient. Set the H+/OH- moles directly
+            # from the target molality (moles = molality * solvent_mass). These are trace species
+            # that occupy negligible volume, so we deliberately do not adjust the solvent mass or
+            # volume - that keeps both the molar and molal concentrations of the other solutes
+            # exactly as specified, rather than perturbing them via a volume/solvent recalculation.
+            solvent_kg = self.solvent_mass.to("kg").magnitude
+            self.components["H+"] = a_H / gamma_H * solvent_kg
+            self.components["OH-"] = a_OH / gamma_OH * solvent_kg
+            if np.isclose(self.pH, target_pH, atol=atol):
+                break
+        else:
+            self.logger.warning(
+                f"pH did not converge to the requested value of {target_pH} within {max_iter} "
+                f"iterations (last value: {self.pH}). The H+ activity coefficient may be strongly "
+                "composition-dependent for this solution."
+            )
 
     def _adjust_charge_balance(self, atol=1e-8) -> None:
         """Helper method to adjust the charge balance of the Solution."""
@@ -2313,21 +2546,47 @@ class Solution(MSONable):
                     ]
                 )
                 self.set_amount("H+", f"{new_hplus} mol/L")
-                self.set_amount("OH-", f"{K_W/new_hplus} mol/L")
+                self.set_amount("OH-", f"{K_W / new_hplus} mol/L")
                 return
 
             z = self.get_property(self._cb_species, "charge")
             try:
-                self.add_amount(self._cb_species, f"{-1*cb/z} mol")
+                self.add_amount(self._cb_species, f"{-1 * cb / z} mol")
                 return
             except ValueError:
                 # if the concentration is negative, it must mean there is not enough present.
                 # remove everything that's present and log an error.
-                self.components[self._cb_species] = 0
+                self.components[self._cb_species] = 0.0
                 self.logger.error(
                     f"There is not enough {self._cb_species} present to balance the charge. Try a different species."
                 )
                 return
+
+    def _check_water_stability(self, tol=1e-6) -> None:
+        """Helper method to adjust the thermodynamic stability of the Solution."""
+        temp = self.temperature.to("K")
+        E0_O2 = 1.229 * ureg.V
+
+        lower_limit = -float(self.pH)
+        upper_limit = (ureg.faraday_constant * E0_O2 / (2.303 * ureg.R * temp)).to_base_units().magnitude - float(
+            self.pH
+        )
+
+        if self.pE < lower_limit - tol:
+            msg = (
+                f"Water is thermodynamically unstable under reducing conditions: "
+                f"pH={self.pH:.2f}, pE={self.pE:.2f}. "
+                f"Hydrogen evolution may occur."
+            )
+            self.logger.warning(msg)
+
+        elif self.pE > upper_limit + tol:
+            msg = (
+                f"Water is thermodynamically unstable under oxidizing conditions: "
+                f"pH={self.pH:.2f}, pE={self.pE:.2f}. "
+                f"Oxygen evolution may occur."
+            )
+            self.logger.warning(msg)
 
     def _update_volume(self):
         """Recalculate the solution volume based on composition."""
@@ -2336,7 +2595,7 @@ class Solution(MSONable):
     def _get_solvent_volume(self):
         """Return the volume of the pure solvent."""
         # calculate the volume of the pure solvent
-        solvent_vol = self.solvent_mass / ureg.Quantity(self.water_substance.rho, "g/L")
+        solvent_vol = self.solvent_mass / (self.water_substance.rho * ureg.g / ureg.L)
 
         return solvent_vol.to("L")
 
@@ -2356,20 +2615,35 @@ class Solution(MSONable):
                 d[k] = str(v)
         # replace solutes with the current composition
         d["solutes"] = {k: f"{v} mol" for k, v in self.components.items()}
-        # replace the engine with the associated str
-        d["engine"] = self._engine
+        # Serialize the engine as an MSONable dict. self.engine is always an EOS instance (EOS
+        # subclasses MSONable), so this round-trips faithfully - including the specific engine type
+        # and its constructor arguments (e.g. phreeqc_db) - whether the engine was passed to the
+        # constructor by name (e.g. "native") or as an instance. from_dict / MontyDecoder rebuilds
+        # the engine automatically. Older dicts that stored the engine name as a plain string still
+        # load correctly because __init__ continues to accept engine names.
+        d["engine"] = self.engine.as_dict()
         # d["logger"] = self.logger.__dict__
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> Solution:
-        """Instantiate a Solution from a dictionary generated by as_dict()."""
+    def from_dict(cls, d: dict, **kwargs) -> Solution:
+        """Instantiate a Solution from a dictionary generated by as_dict().
+
+        Args:
+            d (dict): A dictionary representation of a Solution, generated by the as_dict() method.
+
+        Kwargs:
+            Any kwargs passed to this method will be passed to the Solution __init__ method, and will override
+            any values in the dict.
+        """
         # because of the automatic volume updating that takes place during the __init__ process,
         # care must be taken here to recover the exact quantities of solute and volume
-        # first we store the volume of the serialized solution
+        # first we store the volume and solvent mass of the serialized solution
         orig_volume = ureg.Quantity(d["volume"])
+        orig_moles = ureg.Quantity(d["solutes"]["H2O(aq)"]).to("mol").magnitude if "H2O(aq)" in d["solutes"] else None
         # then instantiate a new one
         decoded = {k: MontyDecoder().process_decoded(v) for k, v in d.items() if not k.startswith("@")}
+        decoded.update(kwargs)
         new_sol = cls(**decoded)
         # now determine how different the new solution volume is from the original
         scale_factor = (orig_volume / new_sol.volume).magnitude
@@ -2379,6 +2653,8 @@ class Solution(MSONable):
         # undo the scaling by diving by that scale factor
         for sol in new_sol.components:
             new_sol.components[sol] /= scale_factor
+        if orig_moles is not None:
+            new_sol.components["H2O(aq)"] = orig_moles
         # ensure that another volume update won't be triggered by these changes
         # (this line should in principle be unnecessary, but it doesn't hurt anything)
         new_sol.volume_update_required = False
@@ -2386,14 +2662,49 @@ class Solution(MSONable):
 
     @classmethod
     def from_preset(
-        cls, preset: Literal["seawater", "rainwater", "wastewater", "urine", "normal saline", "Ringers lactate"]
+        cls,
+        preset: Literal[
+            "ash",
+            "batt_mfg",
+            "batt_recycling",
+            "coal_washing",
+            "CRL",
+            "drilling",
+            "excavation",
+            "FGD",
+            "flotation",
+            "gasification",
+            "geothermal",
+            "leachate",
+            "mine_drainage",
+            "mine_tailings",
+            "normal saline",
+            "plating",
+            "pw_conv",
+            "pw_unconv",
+            "rainwater",
+            "refining",
+            "Ringers lactate",
+            "seawater",
+            "semiconductor",
+            "smelting",
+            "tanning",
+            "urine",
+            "waste_gas",
+            "wastewater",
+        ],
+        **kwargs,
     ) -> Solution:
-        """Instantiate a solution from a preset composition.
+        r"""Instantiate a solution from a preset composition.
 
         Args:
             preset (str): String representing the desired solution.
               Valid entries are 'seawater', 'rainwater', 'wastewater',
               'urine', 'normal saline' and 'Ringers lactate'.
+        Kwargs:
+            Any kwargs passed to this method will be passed to the Solution __init__ method, and
+            will override any values in the preset file. This allows you to use a preset as a starting
+            point and then modify it as needed by, e.g., changing the modeling engine or database.
 
         Returns:
             A pyEQL Solution object.
@@ -2404,23 +2715,47 @@ class Solution(MSONable):
         Notes:
             The following sections explain the different solution options:
 
+            - 'ash' - bottom ash transport wastewater from fossil fuel combustion [kwptr2026]_
+            - 'batt_mfg' - wastewater from lead-acid and legacy battery manufacturing processes [kwptr2026]_
+            - 'batt_recycling' - wastewater from lithium ion battery recycling operations [kwptr2026]_
+            - 'coal_washing' - wastewater generated from coal preparation and washing [kwptr2026]_
+            - 'CRL' - combustion residual leachate (CRL) from fossil fuel combustion landfills [kwptr2026]_
+            - 'drilling' - oil and gas drilling wastewater from drilling fluids and cuttings [kwptr2026]_
+            - 'excavation' - wastewater from excavation in metal ore mining operations [kwptr2026]_
+            - 'FGD' - flue gas desulfurization wastewater from SO2 removal from fossil fuel combustion [kwptr2026]_
+            - 'flotation' - milling and flotation wastewater from metal ore extraction [kwptr2026]_
+            - 'gasification' - wastewater from gasification of carbon-based feedstocks to syngas [kwptr2026]_
+            - 'geothermal' - geothermal produced water from geothermal power generation [kwptr2026]_
+            - 'leachate' - leachate from metal ore mining wastes [kwptr2026]_
+            - 'mine_drainage' - acid mine drainage wastewater from coal and metal ore mining operations [kwptr2026]_
+            - 'mine_tailings' - mine tailings pond water from collective metal ore and mining wastes [kwptr2026]_
+            - 'normal saline' or 'NS' - normal saline solution used in medicine [saline]_
+            - 'plating' - typical wastewater from metal electroplating operations [kwptr2026]_
+            - 'pw_conv' - produced water from conventional hydrocarbon production [kwptr2026]_
+            - 'pw_unconv' - produced water from unconventional hydrocarbon production [kwptr2026]_
             - 'rainwater' - pure water in equilibrium with atmospheric CO2 at pH 6
-            - 'seawater' or 'SW'- Standard Seawater. See Table 4 of the Reference for Composition [1]_
-            - 'wastewater' or 'WW' - medium strength domestic wastewater. See Table 3-18 of [2]_
-            - 'urine' - typical human urine. See Table 3-15 of [2]_
-            - 'normal saline' or 'NS' - normal saline solution used in medicine [3]_
-            - 'Ringers lacatate' or 'RL' - Ringer's lactate solution used in medicine [4]_
+            - 'refining' - petroleum refining wastewater from crude oil refineries [kwptr2026]_
+            - 'Ringers lacatate' or 'RL' - Ringer's lactate solution used in medicine [lactate]_
+            - 'seawater' or 'SW'- Standard Seawater. See Table 4 of the Reference for Composition [mf08]_
+            - 'semiconductor' - semiconductor and electronics manufacturing wastewater  [kwptr2026]_
+            - 'smelting' - wastewater from metal ore smelting and refining from pyrometallurgical slags [kwptr2026]_
+            - 'tanning' - wastewater from leather tanning and finishing operations [kwptr2026]_
+            - 'urine' - typical human urine. See Table 3-15 of [me13]_
+            - 'waste_gas' - wastewater from waste gas treatment during pyrometallurgical processing in metal ore and mining operations [kwptr2026]_
+            - 'wastewater' or 'WW' - medium strength domestic wastewater. See Table 3-18 of [me13]_
 
         References:
-            .. [1] Millero, Frank J. "The composition of Standard Seawater and the definition of
-                   the Reference-Composition Salinity Scale." *Deep-sea Research. Part I* 55(1), 2008, 50-72.
+            .. [mf08] Millero, Frank J. "The composition of Standard Seawater and the definition of
+               the Reference-Composition Salinity Scale." *Deep-sea Research. Part I* 55(1), 2008, 50-72.
 
-            .. [2] Metcalf & Eddy, Inc. et al. *Wastewater Engineering: Treatment and Resource Recovery*, 5th Ed.
-                   McGraw-Hill, 2013.
+            .. [me13] Metcalf & Eddy, Inc. et al. *Wastewater Engineering: Treatment and Resource Recovery*, 5th Ed.
+               McGraw-Hill, 2013.
 
-            .. [3] https://en.wikipedia.org/wiki/Saline_(medicine)
+            .. [saline] https://en.wikipedia.org/w/index.php?title=Saline_(medicine)&oldid=1298292693
 
-            .. [4] https://en.wikipedia.org/wiki/Ringer%27s_lactate_solution
+            .. [lactate] https://en.wikipedia.org/wiki/Ringer%27s_lactate_solution
+
+            .. [kwptr2026] Monong Wang, Jaebeom Park, Sui Xiong Tay, Vineet Bansal, Emily Rabe, Ryan S. Kingsbury. Composition and Critical Mineral Content of Major Industrial Wastewaters: Implications for Treatment and Resource Recovery Technologies. *Environmental Science & Technology*, in press. https://doi.org/10.1021/acs.est.6c04293
         """
         # preset_dir = files("pyEQL") / "presets"
         # Path to the YAML and JSON files corresponding to the preset
@@ -2435,8 +2770,9 @@ class Solution(MSONable):
         else:
             raise FileNotFoundError(f"Invalid preset! File '{yaml_path}' or '{json_path} not found!")
 
-        # Create and return a Solution object
-        return cls().from_file(preset_path)
+        # Create and return a Solution object. from_file is a classmethod, so call it on the class
+        # directly rather than constructing (and discarding) a default Solution instance.
+        return cls.from_file(preset_path, **kwargs)
 
     def to_file(self, filename: str | Path) -> None:
         """Saving to a .yaml or .json file.
@@ -2457,12 +2793,18 @@ class Solution(MSONable):
             dumpfn(self, filename)
 
     @classmethod
-    def from_file(self, filename: str | Path) -> Solution:
+    def from_file(cls, filename: str | Path, **kwargs) -> Solution:
         """Loading from a .yaml or .json file.
 
         Args:
             filename (str | Path): Path to the .json or .yaml file (including extension) to load the Solution from.
               Valid extensions are .json or .yaml.
+
+        Kwargs:
+            Any kwargs passed to this method will be passed to the Solution __init__ method, and will
+            override any values in the file. This allows you to use a file as a starting point and then
+            modify it as needed by, e.g., changing the modeling engine or database. Supported for both
+            .json and .yaml files.
 
         Returns:
             A pyEQL Solution object.
@@ -2472,26 +2814,19 @@ class Solution(MSONable):
         """
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File '{filename}' not found!")
-        str_filename = str(filename)
-        if "yaml" in str_filename.lower():
-            true_keys = [
-                "solutes",
-                "volume",
-                "temperature",
-                "pressure",
-                "pH",
-                "pE",
-                "balance_charge",
-                "solvent",
-                "engine",
-                # "database",
-            ]
-            solution_dict = loadfn(filename)
-            keys_to_delete = [key for key in solution_dict if key not in true_keys]
-            for key in keys_to_delete:
-                solution_dict.pop(key)
-            return Solution(**solution_dict)
-        return loadfn(filename)
+        loaded = loadfn(filename)
+        # monty >= 2026.7.16 reconstructs both JSON and YAML into a Solution via from_dict; older monty
+        # only does so for JSON and returns a plain dict for YAML. Normalize both to a dict, apply any
+        # override kwargs, and rebuild through from_dict so the result is identical across file types and
+        # monty versions. (#445)
+        if isinstance(loaded, Solution):
+            if not kwargs:
+                return loaded
+            solution_dict = loaded.as_dict()
+        else:
+            solution_dict = loaded  # plain dict; from_dict ignores the @module/@class/@version keys
+        solution_dict.update(kwargs)
+        return cls.from_dict(solution_dict)
 
     # arithmetic operations
     def __add__(self, other: Solution) -> Solution:
@@ -2514,7 +2849,12 @@ class Solution(MSONable):
         if self.solvent != other.solvent:
             raise ValueError("Cannot add Solution with different solvents!")
 
-        if self._engine != other._engine:
+        # Compare the resolved engines by their serialized form rather than the raw ``_engine``
+        # values. ``_engine`` may be a name (e.g. "native") or an EOS instance depending on how each
+        # Solution was constructed (a deserialized Solution now holds an EOS instance), so comparing
+        # ``_engine`` directly would spuriously fail when mixing the two. ``self.engine`` is always an
+        # EOS instance, and its ``as_dict`` captures both the engine type and its arguments.
+        if self.engine.as_dict() != other.engine.as_dict():
             raise ValueError("Cannot add Solution with different engines!")
 
         if self.database != other.database:
@@ -2549,15 +2889,9 @@ class Solution(MSONable):
 
         # retrieve the amount of each component in the parent solution and
         # store in a list.
-        mix_species = FormulaDict({})
-        for sol, amt in self.components.items():
-            mix_species.update({sol: f"{amt} mol"})
-        for sol2, amt2 in other.components.items():
-            if mix_species.get(sol2):
-                orig_amt = float(mix_species[sol2].split(" ")[0])
-                mix_species[sol2] = f"{orig_amt+amt2} mol"
-            else:
-                mix_species.update({sol2: f"{amt2} mol"})
+        mix_amounts = FormulaDict({})
+        for sol, amt in [*self.components.items(), *other.components.items()]:
+            mix_amounts[sol] = amt + mix_amounts.get(sol, 0.0)
 
         # TODO - call equilibrate() here once the method is functional to get new pH and pE, instead of the below
         warnings.warn(
@@ -2565,21 +2899,27 @@ class Solution(MSONable):
             "this property is planned for a future release."
         )
         # calculate the new pH and pE (before reactions) by mixing
-        mix_pH = -np.log10(float(mix_species["H+"].split(" ")[0]) / mix_vol.to("L").magnitude)
+        # for pH, we make sure to conserve the mass of H+ and OH-. By not passing
+        # a kwarg for pH (i.e., by using the default value), the H+ concentration
+        # will override and determine the pH value of the mixed solution.
 
         # pE = -log[e-], so calculate the moles of e- in each solution and mix them
         mol_e_self = 10 ** (-1 * self.pE) * self.volume.to("L").magnitude
         mol_e_other = 10 ** (-1 * other.pE) * other.volume.to("L").magnitude
         mix_pE = -np.log10((mol_e_self + mol_e_other) / mix_vol.to("L").magnitude)
+        solutes = {sol: f"{amount} mol" for sol, amount in mix_amounts.items()}
 
         # create a new solution
         return Solution(
-            mix_species.data,  # pass a regular dict instead of the FormulaDict
+            solutes=solutes,
             volume=str(mix_vol),
             pressure=str(mix_pressure),
             temperature=str(mix_temperature.to("K")),
-            pH=mix_pH,
+            # pH=7, # leave at default value so that H+ concentration determines pH
             pE=mix_pE,
+            engine=self._engine,
+            solvent=self.solvent,
+            database=self.database,
         )
 
     def __sub__(self, other: Solution) -> None:
@@ -2619,7 +2959,7 @@ class Solution(MSONable):
             places: The number of decimal places to round the solute amounts.
         """
         print(self)
-        str1 = "Activities" if units == "activity" else "Amounts"
+        str1 = "Activities" if units == "activity" else "Concentrations"
         str2 = f" ({units})" if units != "activity" else ""
         header = f"\nComponent {str1}{str2}:"
         print(header)
@@ -2637,7 +2977,7 @@ class Solution(MSONable):
 
             amt = self.get_activity(i).magnitude if units == "activity" else self.get_amount(i, units).magnitude
 
-            print(f"{i}:\t {amt:0.{places}f}")
+            print(f"{i:<12} {amt:0.{places}f}")
 
     def __str__(self) -> str:
         # set output of the print() statement for the solution
@@ -2647,100 +2987,82 @@ class Solution(MSONable):
         l4 = f"pH: {self.pH:.1f}"
         l5 = f"pE: {self.pE:.1f}"
         l6 = f"Solvent: {self.solvent}"
-        l7 = f"Components: {self.list_solutes():}"
+        l7 = f"Components: {self.components.keys():}"
         return f"{l1}\n{l2}\n{l3}\n{l4}\n{l5}\n{l6}\n{l7}"
 
     """
     Legacy methods to be deprecated in a future release.
     """
 
-    @deprecated(
-        message="list_salts() is deprecated and will be removed in the next release! Use Solution.get_salt_dict() instead.)"
-    )
-    def list_salts(self, unit="mol/kg", decimals=4):  # pragma: no cover
-        for k, v in self.get_salt_dict().items():
-            print(k + "\t {:0.{decimals}f}".format(v, decimals=decimals))
+    @deprecated(message="add_solute() is deprecated. Use add_amount() instead.")
+    def add_solvent(self, formula: str, amount: str):  # pragma: no cover
+        """Same as add_solute but omits the need to pass solvent mass to pint."""
+        quantity = ureg.Quantity(amount)
+        mw = self.get_property(formula, "molecular_weight")
+        target_mol = quantity.to("moles", "chem", mw=mw, volume=self.volume, solvent_mass=self.solvent_mass)
+        self.components[formula] = target_mol.to("moles").magnitude
 
-    @deprecated(
-        message="list_solutes() is deprecated and will be removed in the next release! Use Solution.components.keys() instead.)"
-    )
-    def list_solutes(self):  # pragma: no cover
-        """List all the solutes in the solution."""
-        return list(self.components.keys())
+    def get_saturation_index(self, get_plot=None) -> dict:
+        r"""
+        Calculate the saturation index of a solute in the solution.
+        Notes:
+            The saturation index (:math:`\mathrm{SI}`) is defined as log10(IAP/Ksp), where IAP is the ion activity product and Ksp is the solubility product constant.
+            This method calculates the saturation index based on the active engine and database from `__init__`. The interpretation of the saturation index values is as follows:
 
-    @deprecated(
-        message="list_concentrations() is deprecated and will be removed in the next release! Use Solution.print() instead.)"
-    )
-    def list_concentrations(self, unit="mol/kg", decimals=4, type="all"):  # pragma: no cover
-        """
-        List the concentration of each species in a solution.
+            - :math:`\mathrm{SI} < 0`: The solution is **undersaturated**. The solid tends to dissolve if present.
 
-        Parameters
-        ----------
-        unit: str
-            String representing the desired concentration ureg.
-        decimals: int
-            The number of decimal places to display. Defaults to 4.
-        type     : str
-            The type of component to be sorted. Defaults to 'all' for all
-            solutes. Other valid arguments are 'cations' and 'anions' which
-            return lists of cations and anions, respectively.
+            - :math:`\mathrm{SI} = 0`: The solution is **at saturation equilibrium**. Therefore, at the saturation limit, the SI is zero.
 
+            - :math:`\mathrm{SI} > 0`: The solution is **supersaturated**. Precipitation is thermodynamically favored, although kinetic factors may delay or prevent it.
+
+        Args:
+            get_plot (bool, optional):
+                If True, displays an interactive bar plot of saturation indices sorted from most oversaturated to least. Defaults to None (no plot).
         Returns:
-        -------
-        dict
-            Dictionary containing a list of the species in solution paired with their amount in the specified units
-        :meta private:
+            dict:
+                A dictionary with mineral phase names as keys and their saturation index values as values, sorted in descending order (most oversaturated to least oversaturated).
         """
-        result_list = []
-        # populate a list with component names
 
-        if type == "all":
-            print("Component Concentrations:\n")
-            print("========================\n")
-            for item in self.components:
-                amount = self.get_amount(item, unit)
-                result_list.append([item, amount])
-                print(item + ":" + "\t {0:0.{decimals}f~}".format(amount, decimals=decimals))
-        elif type == "cations":
-            print("Cation Concentrations:\n")
-            print("========================\n")
-            for item in self.components:
-                if self.components[item].charge > 0:
-                    amount = self.get_amount(item, unit)
-                    result_list.append([item, amount])
-                    print(item + ":" + "\t {0:0.{decimals}f~}".format(amount, decimals=decimals))
-        elif type == "anions":
-            print("Anion Concentrations:\n")
-            print("========================\n")
-            for item in self.components:
-                if self.components[item].charge < 0:
-                    amount = self.get_amount(item, unit)
-                    result_list.append([item, amount])
-                    print(item + ":" + "\t {0:0.{decimals}f~}".format(amount, decimals=decimals))
+        engine = self.engine
 
-        return result_list
+        if not hasattr(engine, "ppsol"):
+            raise NotImplementedError(f"Engine {type(engine).__name__} does not support saturation index calculations.")
 
-    @deprecated(
-        message="list_activities() is deprecated and will be removed in the next release! Use Solution.print() instead.)"
-    )
-    def list_activities(self, decimals=4):  # pragma: no cover
-        """
-        List the activity of each species in a solution.
+        # caching method from Phrqsol
+        if (engine.ppsol is None) or (self.components != engine._stored_comp):
+            engine._destroy_ppsol()
+            engine._setup_ppsol(self)
 
-        Parameters
-        ----------
-        decimals: int
-            The number of decimal places to display. Defaults to 4.
+        ppsol = engine.ppsol
 
-        Returns:
-        -------
-        dict
-            Dictionary containing a list of the species in solution paired with their activity
+        phases = list(ppsol.phases.keys())
+        eq_species_dict = {phase: ppsol.si(phase) for phase in phases}
 
-        :meta private:
-        """
-        print("Component Activities:\n")
-        print("=====================\n")
-        for i in self.components:
-            print(i + ":" + "\t {0.magnitude:0.{decimals}f}".format(self.get_activity(i), decimals=decimals))
+        sorted_eq_species_dict = dict(sorted(eq_species_dict.items(), key=lambda item: item[1], reverse=True))
+
+        if get_plot:
+            import pandas as pd  # noqa: PLC0415
+            import plotly.express as px  # noqa: PLC0415
+
+            df = pd.DataFrame(  # noqa: PD901
+                {"species": list(sorted_eq_species_dict.keys()), "si": list(sorted_eq_species_dict.values())}
+            )
+
+            fig = px.bar(
+                df,
+                x="species",
+                y="si",
+                labels={"species": "Mineral Phase", "si": "Saturation Index"},
+                color="si",
+                color_continuous_scale="Mint",
+            )
+
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                template="plotly_white",
+                height=500,
+            )
+
+            fig.show()
+
+        return sorted_eq_species_dict
